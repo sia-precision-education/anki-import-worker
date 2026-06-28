@@ -1,0 +1,12 @@
+# Metadata only — dependencies are installed from requirements.txt (see Dockerfile).
+[project]
+name = "anki-import-worker"
+version = "0.1.0"
+description = "Standalone worker that renders Anki .apkg decks to HTML for SIA Precision Education"
+requires-python = ">=3.12,<3.14"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"

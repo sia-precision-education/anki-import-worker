@@ -1,0 +1,9 @@
+# anki links a compiled Rust backend; the 26.5 manylinux wheel needs glibc >= 2.35
+# (Debian bookworm / Ubuntu 22.04+) and CPython 3.10-3.13 via its cp310-abi3 wheel.
+# Pin exactly: the import/render API churns across releases (this worker is
+# written against 26.5 — see renderer.py).
+anki==26.5
+azure-storage-blob==12.28.0
+azure-storage-queue==12.15.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
