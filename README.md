@@ -28,6 +28,7 @@ Azure Queue job ──▶ download .apkg from blob ──▶ render every card (
 
 ```json
 {
+  "schema_version": 1,
   "job_id": "<opaque correlation id, treated as a string>",
   "container_name": "<azure blob container to read the deck from / write media to>",
   "apkg_blob_name": "documents/original/<hash>.apkg",
@@ -43,6 +44,7 @@ Header `X-Anki-Callback-Token: $ANKI_CALLBACK_SECRET`.
 
 ```json
 {
+  "schema_version": 1,
   "job_id": "...",
   "status": "ok | partial | failed",
   "deck_name": "Cardiology",
@@ -58,6 +60,21 @@ Header `X-Anki-Callback-Token: $ANKI_CALLBACK_SECRET`.
 
 Media is uploaded to `<container>/<media_prefix>/<hash>.<ext>` and referenced in
 the card HTML by that path; SIA rewrites those into signed media-proxy URLs.
+
+## Stable interface (v1)
+
+The job and callback shapes above are a **versioned, stable contract**, not an
+internal detail. Both messages carry `schema_version` (currently `1`): the worker
+**rejects** a job whose `schema_version` it doesn't speak (rather than
+mis-processing it) and validates that the required fields — `job_id`,
+`container_name`, `apkg_blob_name` — are present. Within a major version, changes
+are additive only (new optional fields); a breaking change bumps the major.
+
+The renderer is not SIA-specific — any caller can drive it:
+- **`cli.py`** is the reference non-SIA consumer: `python cli.py deck.apkg`
+  renders a deck with no Azure, queue, or callback involved at all.
+- The queue/callback path is a generic Azure-blob + HTTP contract; nothing in it
+  is specific to SIA beyond the callback URL and secret you configure.
 
 ## Configuration (environment)
 

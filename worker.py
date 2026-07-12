@@ -44,6 +44,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _MB = 1024 * 1024
+
+# Version of the job/callback contract this worker speaks (see README, "Stable
+# interface"). Bump the major only on a breaking change.
+JOB_SCHEMA_VERSION = 1
+
 _CONTENT_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -120,6 +125,7 @@ def _result_payload(job_id: str, result: RenderResult) -> dict[str, Any]:
     else:
         status = "ok"
     return {
+        "schema_version": JOB_SCHEMA_VERSION,
         "job_id": job_id,
         "status": status,
         "deck_name": result.deck_name,
@@ -154,15 +160,36 @@ def _post_callback(payload: dict[str, Any]) -> None:
     )
 
 
+def _validate_job(data: dict[str, Any]) -> "str | None":
+    """Validate an inbound job against the v1 contract. Returns an error, or None.
+
+    Non-SIA callers can rely on this: an unknown schema_version or a missing
+    required field is rejected rather than silently mis-processed.
+    """
+    version = data.get("schema_version", JOB_SCHEMA_VERSION)
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        return f"schema_version is not an integer: {version!r}"
+    if version != JOB_SCHEMA_VERSION:
+        return f"unsupported schema_version {version} (this worker speaks v{JOB_SCHEMA_VERSION})"
+    for field in ("job_id", "container_name", "apkg_blob_name"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value:
+            return f"missing or empty required string field: {field}"
+    return None
+
+
 def _process_job_sync(message_data: dict[str, Any]) -> None:
     """Blocking unit of work: download -> render -> upload media -> callback."""
-    job_id = message_data.get("job_id")
-    container_name = message_data.get("container_name")
-    apkg_blob_name = message_data.get("apkg_blob_name")
-    if not job_id or not container_name or not apkg_blob_name:
-        logger.error("bad message shape: %s", message_data)
+    error = _validate_job(message_data)
+    if error:
+        logger.error("rejecting job (%s): %s", error, message_data)
         return
 
+    job_id = message_data["job_id"]
+    container_name = message_data["container_name"]
+    apkg_blob_name = message_data["apkg_blob_name"]
     media_prefix = message_data.get("media_prefix", "anki-media")
     max_cards = int(message_data.get("max_cards", 20000))
     max_media_mb = int(message_data.get("max_media_mb", 750))
@@ -191,6 +218,7 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
         except Exception as exc:
             logger.exception("render failed job_id=%s", job_id)
             payload = {
+                "schema_version": JOB_SCHEMA_VERSION,
                 "job_id": job_id,
                 "status": "failed",
                 "deck_name": None,
