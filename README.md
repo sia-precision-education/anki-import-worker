@@ -34,9 +34,15 @@ Azure Queue job ──▶ download .apkg from blob ──▶ render every card (
   "apkg_blob_name": "documents/original/<hash>.apkg",
   "media_prefix": "anki-media",
   "max_cards": 20000,
-  "max_media_mb": 750
+  "max_media_mb": 750,
+  "callback_url": "https://<your-backend>/api/v1/internal/anki/complete"
 }
 ```
+
+`callback_url` is **optional**: supply it and the worker posts that job's results
+there (so one worker can serve several backends); omit it and the worker uses its
+configured `ANKI_CALLBACK_URL`. Either way the host must be allowlisted — see
+`ANKI_ALLOWED_CALLBACK_HOSTS` below.
 
 ### Callback payload (worker → SIA), `POST $ANKI_CALLBACK_URL`
 
@@ -84,6 +90,7 @@ The renderer is not SIA-specific — any caller can drive it:
 | `ANKI_CALLBACK_URL` | yes | SIA endpoint to POST rendered cards to |
 | `ANKI_CALLBACK_SECRET` | yes | Shared secret for the callback header |
 | `ANKI_QUEUE_NAME` | no (`anki-requests`) | Queue to poll |
+| `ANKI_ALLOWED_CALLBACK_HOSTS` | no | Comma-separated hosts a job-supplied `callback_url` may target. Defaults to the host of `ANKI_CALLBACK_URL`. A job naming any other host is rejected, so a forged message can't make the worker send the shared secret elsewhere. |
 | `MAX_CONCURRENT_JOBS` | no (`2`) | In-flight decks |
 | `VISIBILITY_TIMEOUT_SECONDS` | no (`900`) | Must exceed the longest render |
 | `MAX_RETRIES` | no (`1`) | Dequeue attempts before dropping |

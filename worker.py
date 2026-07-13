@@ -24,6 +24,7 @@ import signal
 import sys
 import tempfile
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from azure.core.exceptions import ResourceExistsError
@@ -147,16 +148,17 @@ def _result_payload(job_id: str, result: RenderResult) -> dict[str, Any]:
     }
 
 
-def _post_callback(payload: dict[str, Any]) -> None:
+def _post_callback(payload: dict[str, Any], callback_url: str) -> None:
     headers = {"X-Anki-Callback-Token": settings.callback_secret}
     with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
-        resp = client.post(settings.callback_url, json=payload, headers=headers)
+        resp = client.post(callback_url, json=payload, headers=headers)
         resp.raise_for_status()
     logger.info(
-        "callback ok job_id=%s status=%s cards=%d",
+        "callback ok job_id=%s status=%s cards=%d -> %s",
         payload["job_id"],
         payload["status"],
         len(payload["cards"]),
+        callback_url,
     )
 
 
@@ -177,6 +179,17 @@ def _validate_job(data: dict[str, Any]) -> "str | None":
         value = data.get(field)
         if not isinstance(value, str) or not value:
             return f"missing or empty required string field: {field}"
+
+    # Optional per-job callback, so ONE worker can serve several backends (each
+    # sends its own URL). Honoured only for allowlisted hosts — otherwise a
+    # forged job could make us POST the shared secret to an attacker's server.
+    callback_url = data.get("callback_url")
+    if callback_url is not None:
+        if not isinstance(callback_url, str) or not callback_url:
+            return "callback_url must be a non-empty string when present"
+        host = urlparse(callback_url).netloc
+        if host not in settings.allowed_callback_hosts:
+            return f"callback_url host not allowed: {host!r}"
     return None
 
 
@@ -193,6 +206,8 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
     media_prefix = message_data.get("media_prefix", "anki-media")
     max_cards = int(message_data.get("max_cards", 20000))
     max_media_mb = int(message_data.get("max_media_mb", 750))
+    # Per-job callback (validated above) lets one worker serve prod + staging.
+    callback_url = message_data.get("callback_url") or settings.callback_url
 
     blob_service = BlobServiceClient.from_connection_string(settings.azure_storage_connection_string)
     tmp = tempfile.NamedTemporaryFile(prefix="apkg_", suffix=".apkg", delete=False)
@@ -226,7 +241,7 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
                 "summary": {"imported": 0, "degraded": {}, "skipped": 0},
                 "error": str(exc)[:500],
             }
-        _post_callback(payload)
+        _post_callback(payload, callback_url)
     finally:
         try:
             os.unlink(apkg_path)
