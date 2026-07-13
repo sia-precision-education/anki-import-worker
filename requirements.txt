@@ -5,5 +5,10 @@
 anki==26.5
 azure-storage-blob==12.28.0
 azure-storage-queue==12.15.0
+# Required transport for azure.storage.queue.aio (the async queue client the
+# poll loop uses). The Azure SDK does NOT pull this in by itself — without it
+# the worker dies at startup with:
+#   ImportError: Unable to create async transport. Please check aiohttp is installed.
+aiohttp>=3.9,<4.0
 httpx>=0.27,<1.0
 python-dotenv>=1.0,<2.0
