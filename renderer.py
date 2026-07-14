@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import tempfile
+import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import unquote
@@ -118,8 +119,62 @@ def _attach_audio(
     return html, len(players)
 
 
-def render_apkg(apkg_path: str, media_sink: MediaSink, *, max_cards: int = 20000) -> RenderResult:
+# Decompression bounds. An .apkg is a zip that anki's importer unpacks to disk in
+# full before we ever see a card, so a small malicious archive could exhaust the
+# worker's disk (zip bomb). These bound the *decompressed* deck, read cheaply from
+# the central directory. The ceiling sits well above any real deck (media alone is
+# capped at 750 MB) while catching bombs, which advertise gigabytes-to-petabytes.
+_MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+_MAX_ARCHIVE_ENTRIES = 100_000
+
+
+class ApkgTooLargeError(Exception):
+    """The .apkg's decompressed size or entry count exceeds the safety bounds."""
+
+
+def _guard_archive_bounds(
+    apkg_path: str,
+    *,
+    max_uncompressed_bytes: int = _MAX_UNCOMPRESSED_BYTES,
+    max_entries: int = _MAX_ARCHIVE_ENTRIES,
+) -> None:
+    """Reject an oversized/zip-bomb deck BEFORE anki extracts it to disk.
+
+    Reads only the zip central directory (advertised uncompressed sizes + entry
+    count) — no decompression — so it is cheap and fails fast. Raised errors
+    propagate to the worker's render try/except, which reports a clean import
+    failure rather than stranding the deck.
+    """
+    try:
+        with zipfile.ZipFile(apkg_path) as zf:
+            infos = zf.infolist()
+    except zipfile.BadZipFile as exc:
+        raise ApkgTooLargeError(f"not a valid .apkg archive: {exc}") from exc
+
+    if len(infos) > max_entries:
+        raise ApkgTooLargeError(f"archive has {len(infos)} entries (max {max_entries})")
+
+    total = 0
+    for info in infos:
+        total += info.file_size
+        if total > max_uncompressed_bytes:
+            raise ApkgTooLargeError(
+                f"decompressed size exceeds {max_uncompressed_bytes // (1024 * 1024)} MB"
+            )
+
+
+def render_apkg(
+    apkg_path: str,
+    media_sink: MediaSink,
+    *,
+    max_cards: int = 20000,
+    max_uncompressed_bytes: int = _MAX_UNCOMPRESSED_BYTES,
+    max_entries: int = _MAX_ARCHIVE_ENTRIES,
+) -> RenderResult:
     """Import a `.apkg` into a throwaway collection and render every card to HTML."""
+    _guard_archive_bounds(
+        apkg_path, max_uncompressed_bytes=max_uncompressed_bytes, max_entries=max_entries
+    )
     workdir = tempfile.mkdtemp(prefix="anki_render_")
     col_path = os.path.join(workdir, "collection.anki2")  # absent path -> created fresh
     col = Collection(col_path)
