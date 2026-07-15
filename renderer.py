@@ -66,6 +66,12 @@ class RenderedCard:
     cloze: bool
     tags: list[str]
     media: list[str] = field(default_factory=list)
+    # Stable natural key: the note's guid (survives export/re-import — it's how
+    # Anki itself dedupes on sync) plus the card's template ordinal. Lets the
+    # backend derive a deterministic flashcard id so a redelivered chunk (the
+    # queue re-renders the whole deck on any retry) dedupes instead of inserting
+    # duplicates. Independent of render order.
+    uid: str = ""
 
 
 @dataclass
@@ -238,6 +244,7 @@ def render_apkg(
                     cloze=nt.get("type") == MODEL_CLOZE,
                     tags=list(note.tags),
                     media=used,
+                    uid=f"{note.guid}:{card.ord}",
                 )
             )
     finally:

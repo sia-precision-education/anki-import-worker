@@ -23,6 +23,8 @@ import os
 import signal
 import sys
 import tempfile
+from collections import Counter
+from math import ceil
 from typing import Any
 from urllib.parse import urlparse
 
@@ -118,31 +120,50 @@ class BlobMediaSink:
         return blob_name
 
 
-def _result_payload(job_id: str, result: RenderResult) -> dict[str, Any]:
+def _card_dict(c: Any) -> dict[str, Any]:
+    return {
+        "front_html": c.front_html,
+        "back_html": c.back_html,
+        "css": c.css,
+        "deck": c.deck,
+        "note_type": c.note_type,
+        "cloze": c.cloze,
+        "tags": c.tags,
+        "media": c.media,
+        "uid": c.uid,
+    }
+
+
+def _job_status(result: RenderResult) -> str:
     if result.imported == 0:
-        status = "failed"
-    elif result.skipped > 0:
-        status = "partial"
-    else:
-        status = "ok"
+        return "failed"
+    return "partial" if result.skipped > 0 else "ok"
+
+
+def _deck_stats(result: RenderResult) -> dict[str, Any]:
+    """Aggregate counts the backend needs for its deck overview.
+
+    Computed here because the worker holds the whole rendered deck; the backend
+    only ever sees it a chunk at a time. Capped to the most-common few so a deck
+    with pathologically many subdecks can't bloat every chunk.
+    """
+    subdecks = Counter((c.deck or "Default").split("::")[-1] for c in result.cards)
+    note_types = Counter(c.note_type or "Basic" for c in result.cards)
+    return {
+        "total": len(result.cards),
+        "subdecks": dict(subdecks.most_common(50)),
+        "note_types": dict(note_types.most_common(50)),
+    }
+
+
+def _result_payload(job_id: str, result: RenderResult) -> dict[str, Any]:
     return {
         "schema_version": JOB_SCHEMA_VERSION,
         "job_id": job_id,
-        "status": status,
+        "status": _job_status(result),
         "deck_name": result.deck_name,
-        "cards": [
-            {
-                "front_html": c.front_html,
-                "back_html": c.back_html,
-                "css": c.css,
-                "deck": c.deck,
-                "note_type": c.note_type,
-                "cloze": c.cloze,
-                "tags": c.tags,
-                "media": c.media,
-            }
-            for c in result.cards
-        ],
+        "cards": [_card_dict(c) for c in result.cards],
+        "stats": _deck_stats(result),
         "summary": {"imported": result.imported, "degraded": result.degraded, "skipped": result.skipped},
         "error": None,
     }
@@ -160,6 +181,51 @@ def _post_callback(payload: dict[str, Any], callback_url: str) -> None:
         len(payload["cards"]),
         callback_url,
     )
+
+
+def _post_result(job_id: str, result: RenderResult, callback_url: str, chunk_size: "int | None") -> None:
+    """Deliver rendered cards to the backend callback.
+
+    With a positive `chunk_size` (the backend advertising it speaks the chunked
+    contract) the cards are fanned across several callbacks so no single POST
+    ever carries a whole large deck — bounding payload size, request time, and
+    the cost of a retry. Each chunk is self-describing (`chunk_index`,
+    `chunk_count`, `start_index`) and carries the deck-wide `stats`/`summary`, so
+    the final chunk can finalise without the backend holding cross-chunk state.
+    Any chunk POST that fails raises, so the queue redelivers the whole job; the
+    backend dedupes replayed cards by their stable `uid`.
+
+    Absent/zero `chunk_size` falls back to a single callback (v1 behaviour), so a
+    new worker stays correct against a backend that predates chunking.
+    """
+    cards = [_card_dict(c) for c in result.cards]
+    if not chunk_size or chunk_size <= 0 or not cards:
+        _post_callback(_result_payload(job_id, result), callback_url)
+        return
+
+    status = _job_status(result)
+    stats = _deck_stats(result)
+    summary = {"imported": result.imported, "degraded": result.degraded, "skipped": result.skipped}
+    chunk_count = ceil(len(cards) / chunk_size)
+    logger.info("chunking job_id=%s cards=%d into %d chunk(s) of %d", job_id, len(cards), chunk_count, chunk_size)
+    for idx in range(chunk_count):
+        start = idx * chunk_size
+        _post_callback(
+            {
+                "schema_version": JOB_SCHEMA_VERSION,
+                "job_id": job_id,
+                "status": status,
+                "deck_name": result.deck_name,
+                "chunk_index": idx,
+                "chunk_count": chunk_count,
+                "start_index": start,
+                "cards": cards[start : start + chunk_size],
+                "stats": stats,
+                "summary": summary,
+                "error": None,
+            },
+            callback_url,
+        )
 
 
 def _validate_job(data: dict[str, Any]) -> "str | None":
@@ -206,6 +272,11 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
     media_prefix = message_data.get("media_prefix", "anki-media")
     max_cards = int(message_data.get("max_cards", 20000))
     max_media_mb = int(message_data.get("max_media_mb", 750))
+    # Optional (additive, still v1): a positive chunk_size means the backend
+    # speaks the chunked-callback contract, so fan the deck across several POSTs.
+    # Absent -> one callback (a backend that predates chunking).
+    raw_chunk = message_data.get("chunk_size")
+    chunk_size = int(raw_chunk) if isinstance(raw_chunk, int) and not isinstance(raw_chunk, bool) and raw_chunk > 0 else None
     # Per-job callback (validated above) lets one worker serve prod + staging.
     callback_url = message_data.get("callback_url") or settings.callback_url
 
@@ -222,26 +293,30 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
         sink = BlobMediaSink(cc, media_prefix, max_media_mb * _MB)
         try:
             result = render_apkg(apkg_path, sink, max_cards=max_cards)
-            payload = _result_payload(job_id, result)
-            logger.info(
-                "rendered job_id=%s deck=%r imported=%d skipped=%d",
-                job_id,
-                result.deck_name,
-                result.imported,
-                result.skipped,
-            )
         except Exception as exc:
             logger.exception("render failed job_id=%s", job_id)
-            payload = {
-                "schema_version": JOB_SCHEMA_VERSION,
-                "job_id": job_id,
-                "status": "failed",
-                "deck_name": None,
-                "cards": [],
-                "summary": {"imported": 0, "degraded": {}, "skipped": 0},
-                "error": str(exc)[:500],
-            }
-        _post_callback(payload, callback_url)
+            _post_callback(
+                {
+                    "schema_version": JOB_SCHEMA_VERSION,
+                    "job_id": job_id,
+                    "status": "failed",
+                    "deck_name": None,
+                    "cards": [],
+                    "stats": {"total": 0, "subdecks": {}, "note_types": {}},
+                    "summary": {"imported": 0, "degraded": {}, "skipped": 0},
+                    "error": str(exc)[:500],
+                },
+                callback_url,
+            )
+            return
+        logger.info(
+            "rendered job_id=%s deck=%r imported=%d skipped=%d",
+            job_id,
+            result.deck_name,
+            result.imported,
+            result.skipped,
+        )
+        _post_result(job_id, result, callback_url, chunk_size)
     finally:
         try:
             os.unlink(apkg_path)
