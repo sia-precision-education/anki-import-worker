@@ -42,6 +42,8 @@ from anki.collection import (
 )
 from anki.consts import MODEL_CLOZE
 
+from media_paths import safe_media_name, within_dir
+
 logger = logging.getLogger(__name__)
 
 # (absolute_local_path, original_filename) -> stored reference to put in the
@@ -205,10 +207,25 @@ def render_apkg(
         media_cache: dict[str, "str | None"] = {}
 
         def store(fname: str) -> "str | None":
+            """Resolve one media reference inside the collection's media dir.
+
+            The single gate for both callers, because the name is attacker-
+            controlled in each: `<img src>` in the card HTML and the AV tag's
+            filename. `os.path.join` does NOT contain a traversal — an absolute
+            second argument replaces the first outright — so an unchecked name
+            let a crafted deck read any file the worker could and hand it to the
+            sink, which uploads it to the uploader's own container.
+            """
             if fname in media_cache:
                 return media_cache[fname]
-            local = os.path.join(media_dir, fname)
-            ref = media_sink(local, fname) if os.path.isfile(local) else None
+            ref = None
+            safe = safe_media_name(fname)
+            if safe is not None:
+                local = os.path.join(media_dir, safe)
+                if within_dir(media_dir, local) and os.path.isfile(local):
+                    ref = media_sink(local, safe)
+            elif fname:
+                logger.warning("rejected media reference outside the media dir: %r", fname)
             media_cache[fname] = ref
             return ref
 
