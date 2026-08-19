@@ -33,6 +33,7 @@ import tempfile
 import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from html import unescape as html_unescape
 from urllib.parse import unquote
 
 from anki.collection import (
@@ -51,8 +52,16 @@ logger = logging.getLogger(__name__)
 MediaSink = Callable[[str, str], "str | None"]
 
 # Anki cards reference media as bare local filenames (`<img src="x.jpg">`); we
-# only ever rewrite those, never absolute/scheme/data URLs.
-_IMG_SRC_RE = re.compile(r'(<img\b[^>]*?\bsrc\s*=\s*)(["\'])(.*?)\2', re.IGNORECASE | re.DOTALL)
+# only ever rewrite those, never absolute/scheme/data URLs. Matched as a whole
+# TAG rather than just the attribute so an unresolvable ref can be replaced
+# outright, not merely blanked.
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_SRC_ATTR_RE = re.compile(r'(\bsrc\s*=\s*)(["\'])(.*?)\2', re.IGNORECASE | re.DOTALL)
+
+# Stands in for an image that could not be stored. A span, not a marked <img>:
+# an <img> with no src renders 0x0, and generated content on a replaced element
+# is unreliable, so there would be nothing for the client to make visible.
+_MISSING_MEDIA_HTML = '<span data-anki-missing="1">Image unavailable</span>'
 # `card.question()/answer()` keep audio out of the HTML and leave a placeholder
 # token; the filenames come from the AV-tag lists instead.
 _AV_PLACEHOLDER_RE = re.compile(r"\[anki:play:[qa]:\d+\]")
@@ -85,20 +94,40 @@ class RenderResult:
     skipped: int
 
 
-def _rewrite_img_media(html: str, store: Callable[[str], "str | None"], used: list[str]) -> str:
-    """Rewrite bare `<img src="file">` refs to whatever the sink stored them as."""
+def _rewrite_img_media(
+    html: str, store: Callable[[str], "str | None"], used: list[str]
+) -> tuple[str, int]:
+    """Rewrite bare `<img src="file">` refs to whatever the sink stored them as.
+
+    Returns the HTML and the count that could NOT be resolved. An unresolved ref
+    used to be left verbatim, which the backend does not rewrite (it only touches
+    the media prefix) and the client's sanitizer then strips for not matching the
+    media proxy — leaving a src-less <img> at 0x0, so a card whose front WAS the
+    image rendered as a blank face with nothing counted anywhere.
+    """
+    missing = 0
 
     def repl(match: re.Match[str]) -> str:
-        prefix, quote, src = match.group(1), match.group(2), match.group(3)
+        nonlocal missing
+        tag = match.group(0)
+        attr = _SRC_ATTR_RE.search(tag)
+        if attr is None:
+            return tag
+        src = attr.group(3)
         if not src or "://" in src or src.startswith(("/", "data:", "#")):
-            return match.group(0)
-        ref = store(unquote(src))
+            return tag
+        # Entity-decoded as well as percent-decoded: a field carrying
+        # `fig1&amp;2.png` names a file that is `fig1&2.png` on disk, and
+        # unquote() alone leaves the entity intact so the lookup misses.
+        ref = store(html_unescape(unquote(src)))
         if not ref:
-            return match.group(0)
+            missing += 1
+            return _MISSING_MEDIA_HTML
         used.append(ref)
-        return f"{prefix}{quote}{ref}{quote}"
+        rewritten = f"{attr.group(1)}{attr.group(2)}{ref}{attr.group(2)}"
+        return tag[: attr.start()] + rewritten + tag[attr.end() :]
 
-    return _IMG_SRC_RE.sub(repl, html)
+    return _IMG_TAG_RE.sub(repl, html), missing
 
 
 def _attach_audio(
@@ -188,7 +217,7 @@ def render_apkg(
     col = Collection(col_path)
     cards: list[RenderedCard] = []
     deck_counts: dict[str, int] = {}
-    degraded = {"audio": 0}
+    degraded = {"audio": 0, "media": 0}
     total_cards = 0
 
     try:
@@ -242,11 +271,12 @@ def render_apkg(
             out = card.render_output()  # bare HTML (no <style>); CSS carried separately
 
             used: list[str] = []
-            front = _rewrite_img_media(out.question_text, store, used)
-            back = _rewrite_img_media(out.answer_text, store, used)
+            front, fm = _rewrite_img_media(out.question_text, store, used)
+            back, bm = _rewrite_img_media(out.answer_text, store, used)
             front, fa = _attach_audio(front, card.question_av_tags(), store, used)
             back, ba = _attach_audio(back, card.answer_av_tags(), store, used)
             degraded["audio"] += fa + ba
+            degraded["media"] += fm + bm
 
             deck = col.decks.name(card.current_deck_id())
             deck_counts[deck] = deck_counts.get(deck, 0) + 1
