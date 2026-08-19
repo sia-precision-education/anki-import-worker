@@ -40,7 +40,11 @@ class WorkerSettings:
     # Must exceed the longest plausible deck render+upload, or Azure redelivers
     # the message mid-flight and two workers race the same deck.
     visibility_timeout_seconds: int = 900
-    max_retries: int = 1
+    # Dequeue attempts before the message is dropped. Azure's `dequeue_count` is
+    # already 1 on the FIRST delivery, so 1 meant zero retries: a single 502 during
+    # a deploy discarded a multi-minute render, and the chunked contract's whole
+    # premise is that redelivery is safe (cards carry stable uids).
+    max_retries: int = 3
     log_level: str = "INFO"
     # Hosts this worker is permitted to POST results to. A job-supplied
     # `callback_url` is honoured ONLY if its host is in here — otherwise a forged
@@ -61,7 +65,7 @@ class WorkerSettings:
             max_concurrent_jobs=int(os.getenv("MAX_CONCURRENT_JOBS", "2")),
             queue_poll_interval=int(os.getenv("QUEUE_POLL_INTERVAL", "2")),
             visibility_timeout_seconds=int(os.getenv("VISIBILITY_TIMEOUT_SECONDS", "900")),
-            max_retries=int(os.getenv("MAX_RETRIES", "1")),
+            max_retries=int(os.getenv("MAX_RETRIES", "3")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             allowed_callback_hosts=hosts or (urlparse(callback_url).netloc,),
         )

@@ -23,6 +23,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 from collections import Counter
 from math import ceil
 from typing import Any
@@ -169,11 +170,42 @@ def _result_payload(job_id: str, result: RenderResult) -> dict[str, Any]:
     }
 
 
+# A chunk POST is retried in place before the whole job is failed: a deploy-window
+# 502 costs seconds here, versus re-rendering an entire deck (or, past the dequeue
+# budget, a manual re-upload of up to 512 MB). Only transport errors and 5xx/429 are
+# retried — a 4xx is a contract or token problem that will not fix itself.
+_CALLBACK_ATTEMPTS = 3
+_CALLBACK_BACKOFF_SECONDS = (2.0, 6.0)
+
+
+def _callback_retryable(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500 or exc.response.status_code == 429
+    return isinstance(exc, httpx.RequestError)
+
+
 def _post_callback(payload: dict[str, Any], callback_url: str) -> None:
     headers = {"X-Anki-Callback-Token": settings.callback_secret}
-    with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
-        resp = client.post(callback_url, json=payload, headers=headers)
-        resp.raise_for_status()
+    for attempt in range(_CALLBACK_ATTEMPTS):
+        try:
+            with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
+                resp = client.post(callback_url, json=payload, headers=headers)
+                resp.raise_for_status()
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = attempt == _CALLBACK_ATTEMPTS - 1
+            if last or not _callback_retryable(exc):
+                raise
+            delay = _CALLBACK_BACKOFF_SECONDS[min(attempt, len(_CALLBACK_BACKOFF_SECONDS) - 1)]
+            logger.warning(
+                "callback attempt %d/%d failed for job_id=%s (%s); retrying in %.0fs",
+                attempt + 1,
+                _CALLBACK_ATTEMPTS,
+                payload["job_id"],
+                exc,
+                delay,
+            )
+            time.sleep(delay)
     logger.info(
         "callback ok job_id=%s status=%s cards=%d -> %s",
         payload["job_id"],
@@ -325,6 +357,32 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
         blob_service.close()
 
 
+def _post_job_abandoned(message_data: dict[str, Any], attempts: int, exc: Exception) -> None:
+    """Report a job the worker has given up on, so the deck fails now, not in 30 minutes."""
+    # Re-validated because this runs OUTSIDE _process_job_sync: never POST the
+    # shared secret to a callback_url that has not passed the host allowlist.
+    if _validate_job(message_data) is not None:
+        return
+    job_id = message_data["job_id"]
+    callback_url = message_data.get("callback_url") or settings.callback_url
+    try:
+        _post_callback(
+            {
+                "schema_version": JOB_SCHEMA_VERSION,
+                "job_id": job_id,
+                "status": "failed",
+                "deck_name": None,
+                "cards": [],
+                "stats": {"total": 0, "subdecks": {}, "note_types": {}},
+                "summary": {"imported": 0, "degraded": {}, "skipped": 0},
+                "error": f"import abandoned after {attempts} attempt(s): {exc}"[:500],
+            },
+            callback_url,
+        )
+    except Exception:
+        logger.exception("could not report abandoned job job_id=%s", job_id)
+
+
 class AnkiWorker:
     def __init__(self) -> None:
         self.queue_client: Any = None
@@ -352,15 +410,18 @@ class AnkiWorker:
             await asyncio.to_thread(_process_job_sync, message_data)
             await self.queue_client.delete_message(queue_message)
             logger.info("deleted message id=%s", queue_message.id)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             dequeue_count = queue_message.dequeue_count or 0
             logger.exception(
                 "job failed for message id=%s (attempt=%d)", queue_message.id, dequeue_count + 1
             )
-            # The callback already records render failures on the SIA side, so a
-            # poisoned message past MAX_RETRIES is dropped rather than looped.
+            # Past the budget the message is dropped rather than looped — but say so
+            # first. A job abandoned mid-fan-out has posted no failure of its own, so
+            # without this the deck read as still importing until the backend's
+            # stranded-file reconciler noticed it half an hour later.
             if dequeue_count >= settings.max_retries:
                 logger.error("message id=%s exceeded MAX_RETRIES=%d; deleting", queue_message.id, settings.max_retries)
+                await asyncio.to_thread(_post_job_abandoned, message_data, dequeue_count, exc)
                 try:
                     await self.queue_client.delete_message(queue_message)
                 except Exception:

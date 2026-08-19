@@ -93,7 +93,7 @@ The renderer is not SIA-specific — any caller can drive it:
 | `ANKI_ALLOWED_CALLBACK_HOSTS` | no | Comma-separated hosts a job-supplied `callback_url` may target. Defaults to the host of `ANKI_CALLBACK_URL`. A job naming any other host is rejected, so a forged message can't make the worker send the shared secret elsewhere. |
 | `MAX_CONCURRENT_JOBS` | no (`2`) | In-flight decks |
 | `VISIBILITY_TIMEOUT_SECONDS` | no (`900`) | Must exceed the longest render |
-| `MAX_RETRIES` | no (`1`) | Dequeue attempts before dropping |
+| `MAX_RETRIES` | no (`3`) | Dequeue attempts before dropping (`dequeue_count` is 1 on first delivery, so 1 = no retries) |
 | `LOG_LEVEL` | no (`INFO`) | |
 
 ## Local development
