@@ -16,6 +16,7 @@ loop stays responsive.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -176,6 +177,39 @@ def _result_payload(job_id: str, result: RenderResult) -> dict[str, Any]:
 # retried — a 4xx is a contract or token problem that will not fix itself.
 _CALLBACK_ATTEMPTS = 3
 _CALLBACK_BACKOFF_SECONDS = (2.0, 6.0)
+
+# Lease renewal cadence, as a fraction of the visibility window: renewing at a
+# third of it means two renewals can fail before the lease actually lapses. The
+# floor keeps a small window from turning renewal into a hot loop — and is why
+# the two are checked against each other at startup.
+_LEASE_RENEW_DIVISOR = 3
+_LEASE_RENEW_MIN_SECONDS = 30
+
+
+def _lease_renew_interval() -> float:
+    """Seconds between lease extensions for a job that is still running."""
+    return max(settings.visibility_timeout_seconds // _LEASE_RENEW_DIVISOR, _LEASE_RENEW_MIN_SECONDS)
+
+
+def _assert_lease_cadence() -> None:
+    """Fail fast if the visibility window is too short to be renewed inside.
+
+    The window is a deployment knob and the cadence is code, so they are only
+    correct in relation to each other. If a renewal cannot land twice inside the
+    window, a single failed extension lapses the lease — which is silently the
+    bug renewal exists to fix: the deck comes back on the queue mid-render, is
+    processed a second time, and the run that finishes cannot delete the message.
+    """
+    interval = _lease_renew_interval()
+    visibility = settings.visibility_timeout_seconds
+    if interval * 2 > visibility:
+        msg = (
+            f"VISIBILITY_TIMEOUT_SECONDS ({visibility}s) is too short for the lease "
+            f"cadence ({interval:g}s): it must fit at least two renewals, or one failed "
+            "extension lets the deck be rendered twice. Raise it to at least "
+            f"{int(interval * 2)}s."
+        )
+        raise RuntimeError(msg)
 
 
 def _callback_retryable(exc: Exception) -> bool:
@@ -390,6 +424,7 @@ class AnkiWorker:
         self.current_tasks: set[asyncio.Task] = set()
 
     async def setup(self) -> None:
+        _assert_lease_cadence()
         queue_service = QueueServiceClient.from_connection_string(
             settings.azure_storage_connection_string
         )
@@ -400,14 +435,63 @@ class AnkiWorker:
         except ResourceExistsError:
             logger.info("queue %s already exists", settings.anki_queue_name)
         logger.info(
-            "anki-worker setup complete (concurrency=%d, visibility=%ds)",
+            "anki-worker setup complete (concurrency=%d, visibility=%ds, lease renewed every %gs)",
             settings.max_concurrent_jobs,
             settings.visibility_timeout_seconds,
+            _lease_renew_interval(),
         )
 
+    async def _keep_message_visible(self, message: Any, stop: asyncio.Event) -> None:
+        """Extend a message's lease until `stop` is set.
+
+        The refreshed pop receipt is written back onto `message`: Azure
+        invalidates the previous receipt on every update, and the caller deletes
+        with this same object afterwards. Skipping that write would make the
+        delete fail and the deck be re-rendered — the exact bug this exists to
+        stop.
+
+        Best-effort. If renewal fails the loop exits and the message eventually
+        reappears, which is the behaviour we had before this existed.
+        """
+        interval = _lease_renew_interval()
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                pass
+
+            try:
+                updated = await self.queue_client.update_message(
+                    message, visibility_timeout=settings.visibility_timeout_seconds
+                )
+                if updated is not None and getattr(updated, "pop_receipt", None):
+                    message.pop_receipt = updated.pop_receipt
+                logger.debug("extended lease for message id=%s", getattr(message, "id", None))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not extend lease id=%s, letting it lapse: %s", getattr(message, "id", None), exc)
+                return
+
+    @staticmethod
+    async def _stop_renewer(stop: asyncio.Event, renewer: asyncio.Task) -> None:
+        """Stop the renewer and wait for it, so no renewal races a delete."""
+        stop.set()
+        if renewer.done():
+            return
+        renewer.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await renewer
+
     async def _process_and_cleanup(self, queue_message: Any, message_data: dict[str, Any]) -> None:
+        # Hold the lease for as long as the render actually takes. Without it a
+        # deck slower than the window came back on the queue mid-run, was rendered
+        # a second time alongside the run still in flight, and the run that
+        # finished could not delete the message with its now-stale pop receipt.
+        stop_renewing = asyncio.Event()
+        renewer = asyncio.create_task(self._keep_message_visible(queue_message, stop_renewing))
         try:
             await asyncio.to_thread(_process_job_sync, message_data)
+            await self._stop_renewer(stop_renewing, renewer)
             await self.queue_client.delete_message(queue_message)
             logger.info("deleted message id=%s", queue_message.id)
         except Exception as exc:  # noqa: BLE001
@@ -421,11 +505,19 @@ class AnkiWorker:
             # stranded-file reconciler noticed it half an hour later.
             if dequeue_count >= settings.max_retries:
                 logger.error("message id=%s exceeded MAX_RETRIES=%d; deleting", queue_message.id, settings.max_retries)
+                # Still leased across the abandon callback (it retries, so it is
+                # not instant), then stopped before the delete: a renewal in
+                # flight would invalidate the receipt we delete with.
                 await asyncio.to_thread(_post_job_abandoned, message_data, dequeue_count, exc)
+                await self._stop_renewer(stop_renewing, renewer)
                 try:
                     await self.queue_client.delete_message(queue_message)
                 except Exception:
                     logger.exception("failed to delete poisoned message id=%s", queue_message.id)
+        finally:
+            # Belt and braces: the retry path above leaves the message to be
+            # redelivered, which is correct, but the renewer must not outlive it.
+            await self._stop_renewer(stop_renewing, renewer)
 
     async def poll_queue(self) -> None:
         while self.running:

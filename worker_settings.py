@@ -37,8 +37,10 @@ class WorkerSettings:
     # Knobs.
     max_concurrent_jobs: int = 2
     queue_poll_interval: int = 2
-    # Must exceed the longest plausible deck render+upload, or Azure redelivers
-    # the message mid-flight and two workers race the same deck.
+    # The lease window, renewed at a third of itself for as long as the job runs
+    # (AnkiWorker._keep_message_visible), so it no longer has to exceed the
+    # longest plausible deck. It is what a job gets if the WORKER DIES: the deck
+    # is redelivered this many seconds after the last renewal.
     visibility_timeout_seconds: int = 900
     # Dequeue attempts before the message is dropped. Azure's `dequeue_count` is
     # already 1 on the FIRST delivery, so 1 meant zero retries: a single 502 during
