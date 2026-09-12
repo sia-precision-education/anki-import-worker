@@ -46,6 +46,9 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level, logging.INFO),
     format="%(asctime)s [anki-worker] %(levelname)s: %(message)s",
 )
+# basicConfig sets the root logger, so at INFO the Azure SDK logs full request and
+# response headers on every queue poll.
+logging.getLogger("azure").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 _MB = 1024 * 1024
