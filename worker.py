@@ -209,7 +209,7 @@ def _failure_payload(job_id: str, error: str) -> dict[str, Any]:
 
 # A chunk POST is retried in place before the whole job is failed: a deploy-window
 # 502 costs seconds here, versus re-rendering an entire deck (or, past the dequeue
-# budget, a manual re-upload of up to 512 MB). Only transport errors and 5xx/429 are
+# budget, a manual re-upload of up to 1 GB). Only transport errors and 5xx/429 are
 # retried — a 4xx is a contract or token problem that will not fix itself.
 _CALLBACK_ATTEMPTS = 3
 _CALLBACK_BACKOFF_SECONDS = (2.0, 6.0)
