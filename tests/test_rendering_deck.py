@@ -184,6 +184,67 @@ def test_a_file_the_sink_has_no_room_for_is_not_read(media_apkg):
     assert sink.received == {}
 
 
+def test_the_same_bytes_under_another_name_are_not_lost_to_a_full_cap(tmp_path):
+    """Over the cap, a file whose bytes are already stored resolves through the package's own sha1."""
+    workdir = tmp_path / "dup"
+    workdir.mkdir()
+    col = Collection(str(workdir / "source.anki2"))
+    try:
+        for name in ("a.png", "b.png"):
+            assert col.media.write_data(name, b"\x89PNG same bytes") == name
+        for name in ("a.png", "b.png"):
+            note = col.new_note(col.models.by_name("Basic"))
+            note["Front"] = f'<img src="{name}">'
+            note["Back"] = name
+            col.add_note(note, col.decks.id("Dup"))
+        apkg = _export(col, workdir)
+    finally:
+        col.close()
+
+    class _OneFileCap(_RecordingSink):
+        def has_room(self, _size: int) -> bool:
+            return not self.received
+
+    sink = _OneFileCap()
+    with renderer.open_apkg(apkg, sink) as deck:
+        cards = list(deck)
+
+    assert len(sink.received) == 1
+    assert deck.degraded["media"] == 0
+    assert all("anki-media/" in c.front_html for c in cards)
+
+
+def test_a_file_is_read_once_however_its_name_is_spelled(media_apkg):
+    """Two Unicode spellings of one name, in references or in what warm-up stored, find one file."""
+    decomposed = unicodedata.normalize("NFD", "café.jpg")
+    with renderer.open_apkg(media_apkg, _RecordingSink()) as deck:
+        reads: list[str] = []
+        extract = deck.media.extract
+        deck.media.extract = lambda name: reads.append(name) or extract(name)
+        assert deck._store("café.jpg") == deck._store(decomposed) == "anki-media/café.jpg"
+        assert len(reads) == 1
+
+    with renderer.open_apkg(media_apkg, _RecordingSink()) as deck:
+        deck.seed_media({"café.jpg": "stored/cafe"})
+        deck.media.extract = lambda _name: pytest.fail("read a file warm-up stored")
+        assert deck._store(decomposed) == "stored/cafe"
+
+
+def test_cleanup_runs_even_when_closing_the_collection_fails(media_apkg, monkeypatch):
+    real_close = renderer.Collection.close
+
+    def failing_close(self, *args, **kwargs):
+        real_close(self, *args, **kwargs)
+        msg = "close failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(renderer.Collection, "close", failing_close)
+    with pytest.raises(RuntimeError, match="close failed"), renderer.open_apkg(media_apkg, _sink) as deck:
+        scratch = pathlib.Path(deck.media.scratch_dir)
+
+    assert not scratch.exists()
+
+
 def test_a_large_file_is_read_to_a_temp_file(media_apkg):
     with renderer.open_apkg(media_apkg, _sink) as deck:
         files = list(deck.media.iter_files(in_memory_max=0))
@@ -205,7 +266,8 @@ def test_the_package_is_read_through_an_opener(media_apkg):
         list(deck.media.iter_files(in_memory_max=1024))
         list(deck)
 
-    assert opened == [renderer.RANDOM_READ_BYTES, renderer.SEQUENTIAL_READ_BYTES]
+    # Set-up in one pass, small reads while cards render, one more pass to store media.
+    assert opened == [renderer.SEQUENTIAL_READ_BYTES, renderer.RANDOM_READ_BYTES, renderer.SEQUENTIAL_READ_BYTES]
 
 
 def _export(col: Collection, workdir: pathlib.Path, *, legacy: bool = False) -> str:
@@ -311,15 +373,17 @@ def test_scripts_are_kept_unless_asked(scripted_apkg):
 # --- What a deck unpacks to -------------------------------------------------
 
 _LIMIT = 10 * 1024 * 1024
+_V3 = bytes([0x08, 3])
 
 
-def _package(tmp_path: pathlib.Path, version: int, entries: dict[str, bytes]) -> str:
-    """A package written by hand, `meta` naming its format version (3 = modern)."""
-    path = tmp_path / "crafted.apkg"
+def _package(tmp_path: pathlib.Path, version: int | None, entries: dict[str, bytes], name: str = "crafted.apkg") -> str:
+    """A package written by hand, `meta` naming its format version (3 = modern); None for no `meta`."""
+    path = tmp_path / name
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("meta", bytes([0x08, version]))
-        for name, data in entries.items():
-            zf.writestr(name, data)
+        if version is not None:
+            zf.writestr("meta", bytes([0x08, version]))
+        for entry, data in entries.items():
+            zf.writestr(entry, data)
     return str(path)
 
 
@@ -327,10 +391,10 @@ def _zstd(data: bytes) -> bytes:
     return zstandard.ZstdCompressor().compress(data)
 
 
-def _media_list(*entries: tuple[str, int]) -> bytes:
+def _media_list(*entries: tuple[str, int] | tuple[str, int, bytes]) -> bytes:
     listed = MediaEntries()
-    for name, size in entries:
-        listed.entries.add(name=name, size=size)
+    for name, size, *sha1 in entries:
+        listed.entries.add(name=name, size=size, sha1=sha1[0] if sha1 else b"")
     return _zstd(listed.SerializeToString())
 
 
@@ -343,14 +407,18 @@ def _opened(path: str):
     )
 
 
+def _strip(path: str, out: pathlib.Path, limit: int = _LIMIT) -> None:
+    with zipfile.ZipFile(path) as zf:
+        renderer._write_stripped_package(zf, renderer._read_layout(zf), str(out), max_collection_bytes=limit)
+
+
 def test_a_card_database_that_unpacks_past_the_limit_is_refused(tmp_path):
     bomb = _package(tmp_path, 3, {"collection.anki21b": _zstd(b"\x00" * (_LIMIT + 1)), "media": _media_list()})
     with zipfile.ZipFile(bomb) as zf:
         assert sum(info.file_size for info in zf.infolist()) < 1024 * 1024, "its zip index looks tiny"
 
-        with pytest.raises(renderer.ApkgTooLargeError, match="the deck's cards unpack to more than 10 MB"):
-            renderer._guard_archive_bounds(zf, zstd=True, max_collection_bytes=_LIMIT)
-
+    with pytest.raises(renderer.ApkgTooLargeError, match="the deck's cards unpack to more than 10 MB"):
+        _strip(bomb, tmp_path / "out.apkg")
     with (
         pytest.raises(renderer.ApkgTooLargeError),
         renderer.open_apkg(bomb, _sink, max_collection_bytes=_LIMIT),
@@ -359,15 +427,78 @@ def test_a_card_database_that_unpacks_past_the_limit_is_refused(tmp_path):
 
 
 def test_a_card_database_within_the_limit_passes(tmp_path):
-    package = _package(tmp_path, 2, {"collection.anki21": b"\x00" * _LIMIT})
+    _strip(_package(tmp_path, 2, {"collection.anki21": b"\x00" * _LIMIT}), tmp_path / "out.apkg")
+
+
+def test_every_byte_copied_is_counted_even_where_zstd_yields_nothing(tmp_path):
+    """Skippable frames decode to nothing, but are copied byte for byte."""
+    skippable = b"\x50\x2a\x4d\x18" + (_LIMIT).to_bytes(4, "little") + b"\x00" * _LIMIT
+    padded = _package(tmp_path, 3, {"collection.anki21b": _zstd(b"db") + skippable})
+
+    with pytest.raises(renderer.ApkgTooLargeError, match="unpack to more than"):
+        _strip(padded, tmp_path / "out.apkg")
+
+
+def test_a_padded_meta_is_refused(tmp_path):
+    padded = _package(tmp_path, None, {"meta": _V3 + b"\x00" * 4096, "collection.anki21b": _zstd(b"db")})
+
+    with pytest.raises(renderer.ApkgTooLargeError, match="metadata is too large"):
+        _strip(padded, tmp_path / "out.apkg")
+
+
+@pytest.mark.filterwarnings("ignore:Duplicate name")
+def test_only_the_card_database_anki_reads_is_copied(tmp_path):
+    """One entry, once: a package naming the same file eight times gets no extra allowance."""
+    path = tmp_path / "dupes.apkg"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("meta", bytes([0x08, 2]))
+        for _ in range(8):
+            zf.writestr("collection.anki21", b"\x00" * (_LIMIT // 2))
+        zf.writestr("collection.anki2", b"\x00" * (_LIMIT // 2))
+
+    _strip(str(path), tmp_path / "out.apkg")
+
+    with zipfile.ZipFile(tmp_path / "out.apkg") as out:
+        assert sorted(out.namelist()) == ["collection.anki21", "media", "meta"]
+
+
+@pytest.mark.parametrize(
+    ("version", "names", "read"),
+    [
+        (3, ["collection.anki2", "collection.anki21b"], "collection.anki21b"),
+        (2, ["collection.anki2", "collection.anki21"], "collection.anki21"),
+        (1, ["collection.anki2"], "collection.anki2"),
+        (None, ["collection.anki2", "collection.anki21"], "collection.anki21"),
+        (None, ["collection.anki2"], "collection.anki2"),
+    ],
+)
+def test_the_card_database_follows_the_package_version(tmp_path, version, names, read):
+    package = _package(tmp_path, version, dict.fromkeys(names, b"db"))
     with zipfile.ZipFile(package) as zf:
-        renderer._guard_archive_bounds(zf, zstd=False, max_collection_bytes=_LIMIT)
+        layout = renderer._read_layout(zf)
+    assert layout.collection.filename == read
+    assert layout.zstd is (read == "collection.anki21b")
+
+
+def test_a_package_without_its_card_database_is_refused(tmp_path):
+    with (
+        zipfile.ZipFile(_package(tmp_path, 3, {"collection.anki2": b"db"})) as zf,
+        pytest.raises(renderer.ApkgTooLargeError, match="no collection.anki21b"),
+    ):
+        renderer._read_layout(zf)
 
 
 def test_media_does_not_count_toward_the_card_database_limit(tmp_path):
-    package = _package(tmp_path, 3, {"0": _zstd(b"\x00" * (_LIMIT + 1)), "media": _media_list(("big.wav", _LIMIT + 1))})
-    with zipfile.ZipFile(package) as zf:
-        renderer._guard_archive_bounds(zf, zstd=True, max_collection_bytes=_LIMIT)
+    package = _package(
+        tmp_path,
+        3,
+        {
+            "collection.anki21b": _zstd(b"db"),
+            "0": _zstd(b"\x00" * (_LIMIT + 1)),
+            "media": _media_list(("big.wav", _LIMIT + 1)),
+        },
+    )
+    _strip(package, tmp_path / "out.apkg")
 
 
 def test_a_media_file_past_its_declared_size_is_left_out(tmp_path):
@@ -388,12 +519,15 @@ def test_a_media_file_past_its_declared_size_is_left_out(tmp_path):
         assert not [p for p in tmp_path.iterdir() if p.name.startswith("media_")], "the partial file is removed"
 
 
-def test_a_media_file_over_the_per_file_limit_is_not_read(tmp_path, monkeypatch):
+def test_a_media_file_over_the_per_file_limit_is_not_read_or_counted(tmp_path, monkeypatch):
     monkeypatch.setattr(renderer, "_MAX_MEDIA_FILE_BYTES", 10)
-    package = _package(tmp_path, 3, {"0": _zstd(b"x" * 11), "media": _media_list(("big.png", 11))})
+    package = _package(
+        tmp_path, 3, {"0": _zstd(b"x" * 11), "1": _zstd(b"ok"), "media": _media_list(("big.mp4", 11), ("ok.png", 2))}
+    )
     zf, media = _opened(package)
     with zf:
-        assert media.extract("big.png") is None
+        assert media.extract("big.mp4") is None
+        assert media.entries() == [("ok.png", 2)], "one huge video cannot push the deck over the media cap"
 
 
 def test_a_compressible_file_is_stored_as_what_it_unpacks_to(tmp_path):
@@ -413,6 +547,51 @@ def test_a_modern_media_entry_that_is_not_zstd_is_left_out(tmp_path):
         assert media.extract("x.png") is None
 
 
+def _corrupt_member(path: pathlib.Path, member: str) -> None:
+    """Overwrite the middle of a member's stored bytes in place."""
+    with zipfile.ZipFile(path) as zf:
+        info = zf.getinfo(member)
+    raw = bytearray(path.read_bytes())
+    start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    middle = start + info.compress_size // 2
+    raw[middle : middle + 8] = b"\xff" * 8
+    path.write_bytes(bytes(raw))
+
+
+def _mark_encrypted(path: pathlib.Path, member: str) -> None:
+    """Set the encrypted flag on a member, in its local header and its central directory record."""
+    with zipfile.ZipFile(path) as zf:
+        offset = zf.getinfo(member).header_offset
+    raw = bytearray(path.read_bytes())
+    raw[offset + 6] |= 0x1
+    at = raw.find(b"PK\x01\x02")
+    while at != -1:
+        name_len = int.from_bytes(raw[at + 28 : at + 30], "little")
+        if raw[at + 46 : at + 46 + name_len] == member.encode():
+            raw[at + 8] |= 0x1
+        at = raw.find(b"PK\x01\x02", at + 4)
+    path.write_bytes(bytes(raw))
+
+
+def test_an_entry_zipfile_cannot_read_leaves_out_that_file_only(tmp_path):
+    """Corrupt bzip2 raises OSError and an encrypted entry RuntimeError; neither may fail the deck."""
+    path = tmp_path / "older.apkg"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("meta", bytes([0x08, 2]))
+        zf.writestr(zipfile.ZipInfo("0"), b"bz" * 50_000, compress_type=zipfile.ZIP_BZIP2)
+        zf.writestr("1", b"secret")
+        zf.writestr("2", b"fine")
+        zf.writestr("media", json.dumps({"0": "corrupt.png", "1": "locked.png", "2": "ok.png"}))
+    _corrupt_member(path, "0")
+    _mark_encrypted(path, "1")
+
+    zf, media = _opened(str(path))
+    with zf:
+        assert media.extract("corrupt.png") is None
+        assert media.extract("locked.png") is None
+        assert [f.name for f in media.iter_files(in_memory_max=1 << 20)] == ["ok.png"]
+
+
 def test_an_older_package_is_read_as_stored(tmp_path):
     """Anki copies an older package's media as-is, so zstd-looking bytes there are not unpacked."""
     packed = _zstd(b"\x00" * 1000)
@@ -430,6 +609,104 @@ def test_names_that_are_not_bare_filenames_are_not_listed(tmp_path):
     zf, media = _opened(package)
     with zf:
         assert media.entries() == [("ok.png", 1)]
+
+
+def test_one_entry_is_listed_under_one_name(tmp_path):
+    """`legacy_zip_filename` lets many names point at one entry, which warm-up would read once per name."""
+    listed = MediaEntries()
+    for i in range(5):
+        listed.entries.add(name=f"alias{i}.png", size=1, legacy_zip_filename=0)
+    package = _package(
+        tmp_path, 3, {"0": _zstd(b"a"), "1": b"", "2": b"", "3": b"", "media": _zstd(listed.SerializeToString())}
+    )
+    zf, media = _opened(package)
+    with zf:
+        assert media.entries() == [("alias0.png", 1)]
+
+
+def test_a_media_list_naming_more_files_than_the_archive_holds_is_refused(tmp_path):
+    package = _package(tmp_path, 3, {"0": _zstd(b"a"), "media": _media_list(*((f"{i}.png", 1) for i in range(10)))})
+    with zipfile.ZipFile(package) as zf, pytest.raises(renderer.ApkgTooLargeError, match="more files than"):
+        renderer._read_media_list(zf, True)
+
+
+def test_a_media_list_of_empty_entries_is_refused_before_it_is_parsed(tmp_path, monkeypatch):
+    """Millions of 2-byte entries compress to almost nothing; parsed, they took 1.5 GB."""
+    monkeypatch.setattr(
+        renderer, "MediaEntries", type("Unparsed", (), {"FromString": lambda _d: pytest.fail("parsed the list")})
+    )
+    package = _package(tmp_path, 3, {"0": _zstd(b"a"), "media": _zstd(b"\x0a\x00" * 1_000_000)})
+    with zipfile.ZipFile(package) as zf, pytest.raises(renderer.ApkgTooLargeError, match="more files than"):
+        renderer._read_media_list(zf, True)
+
+
+def test_media_entries_are_counted_off_the_wire():
+    listed = MediaEntries()
+    listed.entries.add(name="a.png", size=300, sha1=b"\x01" * 20)
+    listed.entries.add(name="b.png", size=1, legacy_zip_filename=7)
+    listed.entries.add()
+    data = listed.SerializeToString()
+
+    assert renderer._listed_count(data, stop_after=10) == 3
+    assert renderer._listed_count(b"\x0a\x00" * 1_000_000, stop_after=5) == 6, "stops once over"
+    with pytest.raises(renderer.DecodeError):
+        renderer._listed_count(b"\x0a\xff", stop_after=10)
+
+
+def test_media_reads_stop_at_the_decks_budget(tmp_path):
+    """Identical files are stored once, so only a budget on what is decoded bounds the reads."""
+    zeros = b"\x00" * 100
+    files = {str(i): _zstd(zeros) for i in range(5)}
+    package = _package(tmp_path, 3, {**files, "media": _media_list(*((f"{i}.png", len(zeros)) for i in range(5)))})
+    with zipfile.ZipFile(package) as zf:
+        entries = renderer._read_media_list(zf, True)
+        media = renderer.PackageMedia(
+            zf, True, entries, renderer._as_opener(package), str(tmp_path), max_read_bytes=250
+        )
+        assert media.extract("0.png") is not None
+        assert media.extract("1.png") is not None
+        assert media.extract("2.png") is None, "crosses the budget"
+        assert media.spent
+        assert media.extract("3.png") is None
+        assert list(media.iter_files(in_memory_max=1024)) == []
+
+        fresh = renderer.PackageMedia(
+            zf, True, entries, renderer._as_opener(package), str(tmp_path), max_read_bytes=250
+        )
+        assert [f.name for f in fresh.iter_files(in_memory_max=1024)] == ["0.png", "1.png"]
+
+
+def test_the_media_budget_reaches_the_deck(media_apkg):
+    with renderer.open_apkg(media_apkg, _sink, max_media_read_bytes=12) as deck:
+        assert deck.media._max_read == 12
+        list(deck)
+        assert deck.media.spent
+        assert deck.degraded["media"] > 0
+
+
+def _garble_local_name(path: pathlib.Path, member: str) -> None:
+    """Mark a member's local header name as UTF-8 and make it invalid UTF-8; the central name stays."""
+    with zipfile.ZipFile(path) as zf:
+        offset = zf.getinfo(member).header_offset
+    raw = bytearray(path.read_bytes())
+    raw[offset + 7] |= 0x08  # general purpose bit 11: the name is UTF-8
+    raw[offset + 30] = 0xFF
+    path.write_bytes(bytes(raw))
+
+
+def test_a_header_name_that_is_not_utf8_leaves_out_that_file_only(tmp_path):
+    path = tmp_path / "older.apkg"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("meta", bytes([0x08, 2]))
+        zf.writestr("0", b"bad")
+        zf.writestr("1", b"fine")
+        zf.writestr("media", json.dumps({"0": "bad.png", "1": "ok.png"}))
+    _garble_local_name(path, "0")
+
+    zf, media = _opened(str(path))
+    with zf:
+        assert media.extract("bad.png") is None
+        assert [f.name for f in media.iter_files(in_memory_max=1024)] == ["ok.png"]
 
 
 def test_a_reference_finds_its_file_whatever_its_unicode_form(tmp_path):

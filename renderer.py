@@ -35,6 +35,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import lzma
 import os
 import re
 import shutil
@@ -203,12 +204,12 @@ def _attach_audio(
 # is what is bounded before import; media never reaches disk whole (see `PackageMedia`).
 _MAX_COLLECTION_BYTES = 1024 * 1024 * 1024  # 1 GiB; AnKing's is about 100 MB
 _MAX_ARCHIVE_ENTRIES = 100_000
+# `meta` is PackageMetadata{version}: 2 bytes. Anki reads it whole, so a padded one is refused.
+_MAX_META_BYTES = 1024
 # One media file, decoded. Larger ones are left out (the card shows "Image unavailable").
 _MAX_MEDIA_FILE_BYTES = 256 * 1024 * 1024
-# The media list itself: about 50 bytes a file, so 100,000 files fit many times over.
-_MAX_MEDIA_LIST_BYTES = 64 * 1024 * 1024
-# The card database, under the names anki looks for (anki2, anki21, anki21b).
-_COLLECTION_ENTRY_RE = re.compile(r"collection\.anki2(?:1b?)?")
+# The media list itself: about 60 bytes a file, so 100,000 files fit twice over.
+_MAX_MEDIA_LIST_BYTES = 16 * 1024 * 1024
 _GUARD_READ_BYTES = 1024 * 1024
 # Read-ahead: one pass over every file takes large windows; a file looked up while
 # cards render takes a small one, so it fetches little beyond itself.
@@ -216,6 +217,21 @@ SEQUENTIAL_READ_BYTES = 8 * 1024 * 1024
 RANDOM_READ_BYTES = 256 * 1024
 # What a modern package's media list is when it lists nothing.
 _EMPTY_MEDIA_LIST = zstandard.ZstdCompressor().compress(MediaEntries().SerializeToString())
+# A zip entry that cannot be read: corrupt or truncated data, an unsupported compression
+# method, encryption, or a header name that is not valid UTF-8. A package's stream raises
+# only what its opener raises (the worker's raises AzureError), so none of these means
+# storage is down.
+_UNREADABLE = (
+    zipfile.BadZipFile,
+    zlib.error,
+    zstandard.ZstdError,
+    lzma.LZMAError,
+    EOFError,
+    OSError,
+    NotImplementedError,
+    RuntimeError,
+    UnicodeDecodeError,
+)
 
 
 class ApkgTooLargeError(Exception):
@@ -226,18 +242,74 @@ def _size_label(n: int) -> str:
     return f"{n / 1024**3:g} GB" if n >= 1024**3 else f"{n // 1024**2} MB"
 
 
+def _invalid(exc: BaseException | str) -> ApkgTooLargeError:
+    return ApkgTooLargeError(f"not a valid .apkg archive: {exc}")
+
+
+def _read_meta(zf: zipfile.ZipFile) -> bytes | None:
+    """The package's `meta` entry, refused if it is not tiny; None for an older package without one."""
+    try:
+        info = zf.getinfo("meta")
+    except KeyError:
+        return None
+    try:
+        with zf.open(info) as fh:
+            meta = fh.read(_MAX_META_BYTES + 1)
+    except _UNREADABLE as exc:
+        raise _invalid(exc) from exc
+    if len(meta) > _MAX_META_BYTES:
+        raise _invalid("its metadata is too large")
+    return meta
+
+
+def _meta_version(meta: bytes | None) -> int | None:
+    """PackageMetadata{version = 1}: a tag byte 0x08, then the version."""
+    if meta is None or len(meta) < 2 or meta[0] != 0x08:
+        return None
+    return meta[1]
+
+
 def _is_zstd_package(zf: zipfile.ZipFile) -> bool:
     """Whether anki reads this package's entries as zstd: `meta` version 3 or later.
 
-    `meta` is PackageMetadata{version = 1}, so a tag byte 0x08, then the version.
     Older packages (version 1-2, or no `meta`) store their entries as-is.
     """
+    version = _meta_version(_read_meta(zf))
+    return version is not None and version >= 3
+
+
+@dataclass(frozen=True)
+class _Layout:
+    """What anki reads from a package: its `meta`, and the one card database for its version."""
+
+    meta: bytes | None
+    zstd: bool
+    collection: zipfile.ZipInfo
+
+
+def _read_layout(zf: zipfile.ZipFile, *, max_entries: int = _MAX_ARCHIVE_ENTRIES) -> _Layout:
+    """The package's version and the card database anki will import from it.
+
+    Version 3 packages hold `collection.anki21b` (zstd); version 2 `collection.anki21`;
+    version 1 `collection.anki2`. A package without `meta` is version 2 when it has an
+    anki21 file, else version 1.
+    """
+    infos = zf.infolist()
+    if len(infos) > max_entries:
+        raise ApkgTooLargeError(f"archive has {len(infos)} entries (max {max_entries})")
+    meta = _read_meta(zf)
+    version = _meta_version(meta)
+    if version is not None and version >= 3:
+        name = "collection.anki21b"
+    elif version == 2 or (version is None and "collection.anki21" in zf.namelist()):
+        name = "collection.anki21"
+    else:
+        name = "collection.anki2"
     try:
-        with zf.open("meta") as fh:
-            raw = fh.read(2)
+        collection = zf.getinfo(name)
     except KeyError:
-        return False
-    return len(raw) == 2 and raw[0] == 0x08 and raw[1] >= 3
+        raise _invalid(f"it has no {name}") from None
+    return _Layout(meta=meta, zstd=name.endswith("b"), collection=collection)
 
 
 def _decoded(zf: zipfile.ZipFile, info: zipfile.ZipInfo, zstd: bool) -> BinaryIO:
@@ -248,37 +320,52 @@ def _decoded(zf: zipfile.ZipFile, info: zipfile.ZipInfo, zstd: bool) -> BinaryIO
     return zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True, closefd=True)
 
 
-def _guard_archive_bounds(
-    zf: zipfile.ZipFile,
-    *,
-    zstd: bool,
-    max_collection_bytes: int = _MAX_COLLECTION_BYTES,
-    max_entries: int = _MAX_ARCHIVE_ENTRIES,
+def _write_stripped_package(
+    zf: zipfile.ZipFile, layout: _Layout, out_path: str, *, max_collection_bytes: int = _MAX_COLLECTION_BYTES
 ) -> None:
-    """Reject a package before anki unpacks its card database, if that would be too large.
+    """The package minus its media: `meta`, the one card database, and an empty media list.
 
-    Counts what each collection entry really unpacks to, a block at a time, writing
-    nothing: the zip's own decompression (its CRC check catches an understated size),
-    then the zstd anki decodes in a modern package. The zip index alone gives a modern
-    package's compressed sizes, which let a 60 KB deck unpack to gigabytes. Raised
-    errors reach the worker's render try/except, which reports a clean import failure.
+    Anki imports this, so it unpacks the cards and nothing else; references to media
+    stay in the card HTML exactly as written and resolve through `PackageMedia`. Every
+    byte written is counted against the bound, and so is what a zstd database decodes
+    to, so neither padding nor a compression bomb can fill the disk.
     """
-    infos = zf.infolist()
-    if len(infos) > max_entries:
-        raise ApkgTooLargeError(f"archive has {len(infos)} entries (max {max_entries})")
     too_large = ApkgTooLargeError(f"the deck's cards unpack to more than {_size_label(max_collection_bytes)}")
-    try:
-        for info in infos:
-            if not _COLLECTION_ENTRY_RE.fullmatch(info.filename):
-                continue
-            total = 0
-            with _decoded(zf, info, zstd and info.filename.endswith("b")) as source:
-                while block := source.read(_GUARD_READ_BYTES):
-                    total += len(block)
-                    if total > max_collection_bytes:
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as out:
+        if layout.meta is not None:
+            out.writestr("meta", layout.meta)
+        written = 0
+        with out.open(zipfile.ZipInfo(layout.collection.filename), "w") as dst:
+            try:
+                src = zf.open(layout.collection)
+            except _UNREADABLE as exc:
+                raise _invalid(exc) from exc
+            with src:
+                while True:
+                    try:
+                        block = src.read(_GUARD_READ_BYTES)
+                    except _UNREADABLE as exc:
+                        raise _invalid(exc) from exc
+                    if not block:
+                        break
+                    written += len(block)
+                    if written > max_collection_bytes:
                         raise too_large
-    except (zipfile.BadZipFile, zlib.error, zstandard.ZstdError, EOFError) as exc:
-        raise ApkgTooLargeError(f"not a valid .apkg archive: {exc}") from exc
+                    dst.write(block)
+        out.writestr("media", _EMPTY_MEDIA_LIST if layout.zstd else b"{}")
+    if not layout.zstd:
+        return
+    # What anki unpacks the database to, counted from the copy now on local disk.
+    with zipfile.ZipFile(out_path) as copy:
+        unpacked = 0
+        try:
+            with _decoded(copy, copy.getinfo(layout.collection.filename), zstd=True) as fh:
+                while block := fh.read(_GUARD_READ_BYTES):
+                    unpacked += len(block)
+                    if unpacked > max_collection_bytes:
+                        raise too_large
+        except _UNREADABLE as exc:
+            raise _invalid(exc) from exc
 
 
 @dataclass(frozen=True)
@@ -287,6 +374,44 @@ class _MediaEntry:
     info: zipfile.ZipInfo
     # What the package says the file decodes to; reading stops past it.
     size: int
+    # A modern package's own fingerprint of the file, when it gives one.
+    sha1: bytes | None = None
+
+
+def _varint(data: bytes, pos: int) -> tuple[int, int]:
+    value = shift = 0
+    while pos < len(data) and shift < 64:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, pos
+        shift += 7
+    raise DecodeError("truncated varint")
+
+
+def _listed_count(data: bytes, *, stop_after: int) -> int:
+    """How many entries a serialized `MediaEntries` holds, counting no further than `stop_after + 1`.
+
+    Read off the wire format, so a list of millions of 2-byte empty entries is refused
+    before any becomes an object: parsed, each costs about a hundred times its size.
+    """
+    count = pos = 0
+    while pos < len(data) and count <= stop_after:
+        key, pos = _varint(data, pos)
+        wire_type = key & 7
+        if wire_type == 0:
+            _, pos = _varint(data, pos)
+        elif wire_type == 2:
+            length, pos = _varint(data, pos)
+            pos += length
+        elif wire_type in (1, 5):
+            pos += 8 if wire_type == 1 else 4
+        else:
+            raise DecodeError(f"unexpected wire type {wire_type}")
+        if key >> 3 == 1:  # MediaEntries.entries
+            count += 1
+    return count
 
 
 def _read_media_list(zf: zipfile.ZipFile, zstd: bool) -> list[_MediaEntry]:
@@ -294,12 +419,16 @@ def _read_media_list(zf: zipfile.ZipFile, zstd: bool) -> list[_MediaEntry]:
 
     A modern package lists them in a zstd `MediaEntries` protobuf, each stored under
     its index (or `legacy_zip_filename`); an older one in JSON, `{"0": "name.jpg"}`.
-    Names that are not bare filenames, and entries the archive lacks, are left out.
+    A list naming more files than the archive holds is refused. Names that are not
+    bare filenames, entries the archive lacks, and a second name for an entry already
+    named are left out: aliases would read one entry once per name.
     """
     try:
         info = zf.getinfo("media")
     except KeyError:
         return []
+    too_many = _invalid("the media list names more files than the archive holds")
+    members = len(zf.infolist())
     try:
         buf = io.BytesIO()
         with _decoded(zf, info, zstd) as fh:
@@ -309,32 +438,43 @@ def _read_media_list(zf: zipfile.ZipFile, zstd: bool) -> list[_MediaEntry]:
         if len(data) > _MAX_MEDIA_LIST_BYTES:
             raise ApkgTooLargeError(f"the media list is larger than {_size_label(_MAX_MEDIA_LIST_BYTES)}")
         if zstd:
+            if _listed_count(data, stop_after=members) > members:
+                raise too_many
             listed = [
-                (e.name, str(e.legacy_zip_filename) if e.HasField("legacy_zip_filename") else str(i), e.size)
+                (
+                    e.name,
+                    str(e.legacy_zip_filename) if e.HasField("legacy_zip_filename") else str(i),
+                    e.size,
+                    e.sha1 or None,
+                )
                 for i, e in enumerate(MediaEntries.FromString(data).entries)
             ]
         else:
             mapping = json.loads(data or b"{}")
             if not isinstance(mapping, dict):
-                raise ApkgTooLargeError("not a valid .apkg archive: the media list is not a mapping")
-            listed = [(name, str(member), None) for member, name in mapping.items() if isinstance(name, str)]
-    except (zipfile.BadZipFile, zlib.error, zstandard.ZstdError, EOFError, DecodeError, ValueError) as exc:
-        raise ApkgTooLargeError(f"not a valid .apkg archive: the media list is unreadable ({exc})") from exc
+                raise _invalid("the media list is not a mapping")
+            listed = [(name, str(member), None, None) for member, name in mapping.items() if isinstance(name, str)]
+    except (*_UNREADABLE, DecodeError, ValueError) as exc:
+        raise _invalid(f"the media list is unreadable ({exc})") from exc
+    if len(listed) > members:
+        raise too_many
 
     entries: dict[str, _MediaEntry] = {}
-    rejected = 0
-    for name, member, size in listed:
-        if safe_media_name(name) is None:
-            rejected += 1
+    claimed: set[str] = set()
+    left_out = 0
+    for name, member, size, sha1 in listed:
+        if safe_media_name(name) is None or member in claimed or name in entries:
+            left_out += 1
             continue
         try:
             member_info = zf.getinfo(member)
         except KeyError:
             continue
+        claimed.add(member)
         # An older package's file is stored as-is, so the zip's own size is what it holds.
-        entries.setdefault(name, _MediaEntry(name, member_info, member_info.file_size if size is None else size))
-    if rejected:
-        logger.warning("media list names %d file(s) that are not bare filenames; left out", rejected)
+        entries[name] = _MediaEntry(name, member_info, member_info.file_size if size is None else size, sha1)
+    if left_out:
+        logger.warning("media list names %d file(s) that are not bare filenames or are named twice; left out", left_out)
     return sorted(entries.values(), key=lambda e: e.info.header_offset)
 
 
@@ -365,36 +505,54 @@ class PackageMedia:
 
     Each file is decoded a block at a time and held to the size the package declares
     (and to `_MAX_MEDIA_FILE_BYTES`), so a file that unpacks past its declared size is
-    refused before it fills the disk. A file that cannot be read leaves only its own
-    cards degraded. Storage errors from the package's stream are not caught here: they
-    fail the job, so the queue retries it rather than the deck losing its images.
+    refused before it fills the disk. Everything decoded counts against
+    `max_read_bytes`, stored or not; past it the remaining files are left out. A file
+    that cannot be read leaves only its own cards degraded. Errors from the package's
+    own stream (storage) and from writing the temp file (the disk) are not caught here.
     Not thread-safe: the worker reads media from the job's thread only.
     """
 
     def __init__(
-        self, zf: zipfile.ZipFile, zstd: bool, entries: list[_MediaEntry], opener: PackageOpener, scratch_dir: str
+        self,
+        zf: zipfile.ZipFile,
+        zstd: bool,
+        entries: list[_MediaEntry],
+        opener: PackageOpener,
+        scratch_dir: str,
+        *,
+        max_read_bytes: int | None = None,
     ) -> None:
         self._zf = zf
         self._zstd = zstd
         self._entries = entries
         self._opener = opener
         self.scratch_dir = scratch_dir
+        self._max_read = max_read_bytes
+        self._read = 0
         self._by_name = {e.name: e for e in entries}
         self._by_nfc: dict[str, _MediaEntry] = {}
         for e in entries:
             self._by_nfc.setdefault(unicodedata.normalize("NFC", e.name), e)
 
     def entries(self) -> list[tuple[str, int]]:
-        """Every file as (name, declared size), in archive order."""
-        return [(e.name, e.size) for e in self._entries]
+        """Every file that can be stored, as (name, declared size), in archive order.
+
+        A file over `_MAX_MEDIA_FILE_BYTES` is never stored, so it is not counted here.
+        """
+        return [(e.name, e.size) for e in self._readable()]
 
     def lookup(self, name: str) -> _MediaEntry | None:
         return self._by_name.get(name) or self._by_nfc.get(unicodedata.normalize("NFC", name))
 
+    @property
+    def spent(self) -> bool:
+        """Whether the reads allowed for this deck's media are used up."""
+        return self._max_read is not None and self._read >= self._max_read
+
     def extract(self, name: str) -> str | None:
         """One file into a temp file in the scratch dir (the caller removes it), or None."""
         entry = self.lookup(name)
-        if entry is None:
+        if entry is None or self.spent:
             return None
         try:
             return self._to_file(self._zf, entry)
@@ -412,7 +570,9 @@ class PackageMedia:
         stream = self._opener(SEQUENTIAL_READ_BYTES)
         try:
             with zipfile.ZipFile(stream) as zf:
-                for entry in self._entries:
+                for entry in self._readable():
+                    if self.spent:
+                        break
                     info = zf.getinfo(entry.info.filename)
                     try:
                         if entry.size <= in_memory_max:
@@ -427,6 +587,9 @@ class PackageMedia:
         finally:
             stream.close()
 
+    def _readable(self) -> list[_MediaEntry]:
+        return [e for e in self._entries if e.size <= _MAX_MEDIA_FILE_BYTES]
+
     def _to_file(self, zf: zipfile.ZipFile, entry: _MediaEntry, info: zipfile.ZipInfo | None = None) -> str:
         fd, path = tempfile.mkstemp(prefix="media_", dir=self.scratch_dir)
         try:
@@ -438,33 +601,45 @@ class PackageMedia:
         return path
 
     def _copy(self, zf: zipfile.ZipFile, entry: _MediaEntry, info: zipfile.ZipInfo, out: BinaryIO) -> None:
-        limit = min(entry.size, _MAX_MEDIA_FILE_BYTES)
         if entry.size > _MAX_MEDIA_FILE_BYTES:
             raise _MediaFileError(f"{entry.name!r} is larger than {_size_label(_MAX_MEDIA_FILE_BYTES)}")
-        written = 0
         try:
-            with _decoded(zf, info, self._zstd) as source:
-                while block := source.read(_GUARD_READ_BYTES):
-                    written += len(block)
-                    if written > limit:
-                        raise _MediaFileError(f"{entry.name!r} unpacks to more than the {limit} bytes it declares")
-                    out.write(block)
-        except (zipfile.BadZipFile, zlib.error, zstandard.ZstdError, EOFError) as exc:
+            source = _decoded(zf, info, self._zstd)
+        except _UNREADABLE as exc:
             raise _MediaFileError(f"{entry.name!r} is unreadable ({exc})") from exc
+        written = 0
+        with source:
+            while True:
+                try:
+                    block = source.read(_GUARD_READ_BYTES)
+                except _UNREADABLE as exc:
+                    raise _MediaFileError(f"{entry.name!r} is unreadable ({exc})") from exc
+                if not block:
+                    return
+                written += len(block)
+                if written > entry.size:
+                    raise _MediaFileError(f"{entry.name!r} unpacks to more than the {entry.size} bytes it declares")
+                self._read += len(block)
+                if self._max_read is not None and self._read > self._max_read:
+                    raise _MediaFileError(
+                        f"the deck's media reads passed {_size_label(self._max_read)}; the rest is left out"
+                    )
+                # Outside the read's try: a full disk is not this file's fault, so it fails the job.
+                out.write(block)
 
 
-def _write_stripped_package(zf: zipfile.ZipFile, zstd: bool, out_path: str) -> None:
-    """The package minus its media: `meta`, the card database, and an empty media list.
-
-    Anki imports this, so it unpacks the cards and nothing else; references to media
-    stay in the card HTML exactly as written and resolve through `PackageMedia`.
-    """
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as out:
-        for info in zf.infolist():
-            if info.filename == "meta" or _COLLECTION_ENTRY_RE.fullmatch(info.filename):
-                with zf.open(info) as src, out.open(zipfile.ZipInfo(info.filename), "w") as dst:
-                    shutil.copyfileobj(src, dst, _GUARD_READ_BYTES)
-        out.writestr("media", _EMPTY_MEDIA_LIST if zstd else b"{}")
+@contextmanager
+def _open_zip(opener: PackageOpener, buffer_size: int) -> Generator[zipfile.ZipFile, None, None]:
+    stream = opener(buffer_size)
+    try:
+        try:
+            zf = zipfile.ZipFile(stream)
+        except (zipfile.BadZipFile, zlib.error, EOFError, OSError) as exc:
+            raise _invalid(exc) from exc
+        with zf:
+            yield zf
+    finally:
+        stream.close()  # a ZipFile given a stream leaves it open
 
 
 def _as_opener(source: str | PackageOpener) -> PackageOpener:
@@ -497,6 +672,11 @@ class RenderingDeck:
         self._strip_scripts = strip_scripts
         self.media = media
         self._media_cache: dict[str, str | None] = {}
+        # Results by archive entry, so a name spelled another way does not read its file again.
+        self._ref_by_member: dict[str, str | None] = {}
+        # Stored references by the package's own fingerprint, so a file listed under a
+        # second name is not read (or refused by a full cap) a second time.
+        self._ref_by_sha1: dict[bytes, str] = {}
         card_ids = col.find_cards("")  # "" matches all cards
         self._card_ids = list(card_ids[:max_cards])
         self.skipped = len(card_ids) - len(self._card_ids)
@@ -540,6 +720,9 @@ class RenderingDeck:
     def seed_media(self, stored: Mapping[str, str]) -> None:
         """Media the caller already stored, by name, so rendering does not read it again."""
         self._media_cache.update(stored)
+        for name, ref in stored.items():
+            if (entry := self.media.lookup(name)) is not None:
+                self._ref_by_member[entry.info.filename] = ref
 
     def _placed(self, cid: int) -> tuple[str, dict[str, Any]]:
         """The card's deck name and note type (the current deck, for a filtered one)."""
@@ -561,16 +744,30 @@ class RenderingDeck:
         ref = None
         safe = safe_media_name(fname)
         entry = self.media.lookup(safe) if safe is not None else None
-        if safe is not None and entry is not None and self._has_room(entry.size):
-            local = self.media.extract(safe)
-            if local is not None:
-                try:
-                    ref = self._sink(local, safe)
-                finally:
-                    os.unlink(local)
+        if entry is not None:
+            member = entry.info.filename
+            if member in self._ref_by_member:
+                ref = self._ref_by_member[member]
+            else:
+                ref = self._read_and_store(entry)
+                self._ref_by_member[member] = ref
         elif safe is None and fname:
             logger.warning("rejected media reference that is not a bare filename: %r", fname)
         self._media_cache[fname] = ref
+        return ref
+
+    def _read_and_store(self, entry: _MediaEntry) -> str | None:
+        """Store one listed file, unless the package's fingerprint shows it is stored already."""
+        ref = self._ref_by_sha1.get(entry.sha1) if entry.sha1 else None
+        if ref is None and self._has_room(entry.size):
+            local = self.media.extract(entry.name)
+            if local is not None:
+                try:
+                    ref = self._sink(local, entry.name)
+                finally:
+                    os.unlink(local)
+            if ref is not None and entry.sha1:
+                self._ref_by_sha1[entry.sha1] = ref
         return ref
 
     def _render(self, cid: int) -> RenderedCard:
@@ -612,49 +809,51 @@ def open_apkg(
     max_cards: int = 20000,
     max_collection_bytes: int = _MAX_COLLECTION_BYTES,
     max_entries: int = _MAX_ARCHIVE_ENTRIES,
+    max_media_read_bytes: int | None = None,
     strip_scripts: bool = False,
 ) -> Generator[RenderingDeck, None, None]:
     """Import a package's cards into a throwaway collection, removed when the block exits.
 
     `source` is a path or a `PackageOpener`. Anki imports a copy of the package with
     an empty media list, so its media folder stays empty; the deck's media is read
-    from the package through `RenderingDeck.media`. With `strip_scripts`, `<script>`
-    elements are removed from the rendered HTML (see `remove_scripts`).
+    from the package through `RenderingDeck.media`, up to `max_media_read_bytes`
+    decoded. With `strip_scripts`, `<script>` elements are removed from the rendered
+    HTML (see `remove_scripts`).
     """
     opener = _as_opener(source)
     workdir = tempfile.mkdtemp(prefix="anki_render_")
-    stream = None
-    col = None
     try:
-        stream = opener(RANDOM_READ_BYTES)
-        try:
-            zf = zipfile.ZipFile(stream)
-        except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
-            raise ApkgTooLargeError(f"not a valid .apkg archive: {exc}") from exc
-        zstd = _is_zstd_package(zf)
-        _guard_archive_bounds(zf, zstd=zstd, max_collection_bytes=max_collection_bytes, max_entries=max_entries)
-        media = PackageMedia(zf, zstd, _read_media_list(zf, zstd), opener, workdir)
-
         stripped = os.path.join(workdir, "cards.apkg")
-        _write_stripped_package(zf, zstd, stripped)
-        col = Collection(os.path.join(workdir, "collection.anki2"))  # absent path -> created fresh
-        col.import_anki_package(
-            ImportAnkiPackageRequest(
-                package_path=stripped,
-                options=ImportAnkiPackageOptions(
-                    merge_notetypes=False,
-                    with_scheduling=False,
-                    with_deck_configs=False,
-                ),
+        # One pass in archive order: the layout, then the card database copied out.
+        with _open_zip(opener, SEQUENTIAL_READ_BYTES) as setup:
+            layout = _read_layout(setup, max_entries=max_entries)
+            _write_stripped_package(setup, layout, stripped, max_collection_bytes=max_collection_bytes)
+        with _open_zip(opener, RANDOM_READ_BYTES) as zf:
+            media = PackageMedia(
+                zf,
+                layout.zstd,
+                _read_media_list(zf, layout.zstd),
+                opener,
+                workdir,
+                max_read_bytes=max_media_read_bytes,
             )
-        )
-        os.unlink(stripped)
-        yield RenderingDeck(col, media_sink, max_cards, media=media, strip_scripts=strip_scripts)
+            col = Collection(os.path.join(workdir, "collection.anki2"))  # absent path -> created fresh
+            try:
+                col.import_anki_package(
+                    ImportAnkiPackageRequest(
+                        package_path=stripped,
+                        options=ImportAnkiPackageOptions(
+                            merge_notetypes=False,
+                            with_scheduling=False,
+                            with_deck_configs=False,
+                        ),
+                    )
+                )
+                os.unlink(stripped)
+                yield RenderingDeck(col, media_sink, max_cards, media=media, strip_scripts=strip_scripts)
+            finally:
+                col.close()  # releases the Rust backend's exclusive DB lock
     finally:
-        if col is not None:
-            col.close()  # releases the Rust backend's exclusive DB lock
-        if stream is not None:
-            stream.close()  # a ZipFile given a stream leaves it open
         shutil.rmtree(workdir, ignore_errors=True)
 
 

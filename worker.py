@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -37,7 +38,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO
 from urllib.parse import urlparse
 
 import httpx
-from azure.core.exceptions import AzureError, ResourceExistsError
+from azure.core.exceptions import AzureError, ResourceExistsError, ServiceResponseError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.storage.queue.aio import QueueServiceClient
 from dotenv import load_dotenv
@@ -70,6 +71,9 @@ _WARM_AHEAD = 2 * _WARM_WORKERS
 # upload holds more than this much of a file, however large the file. Files up to
 # this size are read from the package into memory; larger ones into a temp file.
 _SINGLE_PUT_BYTES = 8 * _MB
+# Media a deck may decode, in multiples of its media cap: one pass up front, then
+# files that pass missed read again as cards ask. Anki's own exports stay under it.
+_MEDIA_READS_PER_CAP = 2
 
 # Version of the job/callback contract this worker speaks (see README, "Stable
 # interface"). Bump the major only on a breaking change.
@@ -96,8 +100,9 @@ class _BlobRangeReader(io.RawIOBase):
     """A blob as a seekable file, read in ranges: the package is never downloaded whole.
 
     Wrapped in a `BufferedReader`, whose buffer size is the read-ahead per request.
-    Storage errors propagate (the SDK has already retried them), failing the job so
-    the queue retries it.
+    Every read error is an AzureError (the SDK has already retried it), failing the job
+    so the queue retries it: the renderer treats other errors from a zip entry as that
+    one file being unreadable, so an unwrapped transport error would cost images instead.
     """
 
     def __init__(self, blob_client: Any, size: int) -> None:
@@ -117,8 +122,9 @@ class _BlobRangeReader(io.RawIOBase):
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}[whence]
         if base + offset < 0:
-            msg = "negative seek position"
-            raise ValueError(msg)
+            # OSError, as a file raises: zipfile probes a short archive this way and reads
+            # the error as "not a zip".
+            raise OSError(errno.EINVAL, "negative seek position")
         self._pos = base + offset
         return self._pos
 
@@ -126,7 +132,13 @@ class _BlobRangeReader(io.RawIOBase):
         n = min(len(buffer), self._size - self._pos)
         if n <= 0:
             return 0
-        data = self._bc.download_blob(offset=self._pos, length=n).readall()
+        try:
+            data = self._bc.download_blob(offset=self._pos, length=n).readall()
+        except AzureError:
+            raise
+        except Exception as exc:
+            msg = f"reading the deck failed: {exc}"
+            raise ServiceResponseError(msg) from exc
         memoryview(buffer).cast("B")[: len(data)] = data
         self._pos += len(data)
         return len(data)
@@ -561,6 +573,17 @@ def _validate_job(data: dict[str, Any]) -> "str | None":
     return None
 
 
+def _out_of_disk(exc: BaseException | None) -> bool:
+    """Whether a failure, or anything it was raised from, is a full disk."""
+    while exc is not None:
+        if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            return True
+        if "database or disk is full" in str(exc):  # SQLITE_FULL, from anki's import
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def _process_job_sync(message_data: dict[str, Any]) -> None:
     """Blocking unit of work: read the package -> upload media -> render -> callback."""
     error = _validate_job(message_data)
@@ -596,7 +619,13 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
 
         sink = BlobMediaSink(cc, media_prefix, max_media_mb * _MB)
         try:
-            with open_apkg(package, sink, max_cards=max_cards, strip_scripts=strip_scripts) as deck:
+            with open_apkg(
+                package,
+                sink,
+                max_cards=max_cards,
+                max_media_read_bytes=_MEDIA_READS_PER_CAP * max_media_mb * _MB,
+                strip_scripts=strip_scripts,
+            ) as deck:
                 logger.info(
                     "imported job_id=%s deck=%r cards=%d skipped=%d",
                     job_id,
@@ -611,6 +640,9 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
             # storage: not a bad deck, so the queue redelivers the job.
             raise
         except Exception as exc:
+            if _out_of_disk(exc):
+                # The scratch disk is shared with the other job: not this deck's fault.
+                raise
             logger.exception("render failed job_id=%s", job_id)
             _post_callback(_failure_payload(job_id, str(exc)), callback_url)
             return

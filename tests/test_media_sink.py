@@ -8,6 +8,7 @@ holds at once (memory and disk), and reading the package from blob storage in ra
 """
 
 import contextlib
+import errno
 import hashlib
 import io
 import logging
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from typing import BinaryIO
 
 import pytest
-from azure.core.exceptions import ResourceExistsError, ServiceRequestError
+from azure.core.exceptions import AzureError, ResourceExistsError, ServiceRequestError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -370,6 +371,66 @@ def test_a_failed_warm_up_does_not_fail_the_deck(monkeypatch):
     assert sent == [], "no failure is reported"
 
 
+class _FailsAfterWarmUp(_Deck):
+    def __init__(self, exc: Exception) -> None:
+        super().__init__(_Media({}, None))
+        self._exc = exc
+
+    def seed_media(self, stored: dict) -> None:
+        raise self._exc
+
+
+def _chained(cause: OSError) -> Exception:
+    err = RuntimeError("could not copy the card database")
+    err.__cause__ = cause
+    return err
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError(errno.ENOSPC, "No space left on device"),
+        OSError(errno.EDQUOT, "Disk quota exceeded"),
+        RuntimeError('DbError { info: "database or disk is full" }'),
+        _chained(OSError(errno.ENOSPC, "No space left on device")),
+    ],
+    ids=["ENOSPC", "EDQUOT", "anki", "chained"],
+)
+def test_a_full_scratch_disk_is_left_to_the_queue(monkeypatch, exc):
+    """The disk is shared with the other job, so a full one is not this deck's fault."""
+    with pytest.raises(type(exc)):
+        _run(monkeypatch, _FailsAfterWarmUp(exc))
+
+
+def test_a_deck_that_fails_for_its_own_reasons_is_reported(monkeypatch):
+    sent = _run(monkeypatch, _FailsAfterWarmUp(OSError(errno.EIO, "Input/output error")))
+
+    assert [p["status"] for p in sent] == ["failed"]
+
+
+def test_a_job_bounds_what_its_media_may_decode(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def open_apkg(*_a, **options):
+        seen.update(options)
+        return contextlib.nullcontext(_Deck(_Media({}, tmp_path)))
+
+    monkeypatch.setattr(worker, "_post_deck", lambda *_a: None)
+    blob = types.SimpleNamespace(get_blob_properties=lambda: types.SimpleNamespace(size=2))
+    service = types.SimpleNamespace(
+        get_container_client=lambda _n: types.SimpleNamespace(get_blob_client=lambda _b: blob), close=lambda: None
+    )
+    monkeypatch.setattr(
+        worker, "BlobServiceClient", types.SimpleNamespace(from_connection_string=lambda *_a, **_k: service)
+    )
+    monkeypatch.setattr(worker, "open_apkg", open_apkg)
+    worker._process_job_sync(
+        {"job_id": "file-1", "container_name": "c", "apkg_blob_name": "x.apkg", "max_media_mb": 100}
+    )
+
+    assert seen["max_media_read_bytes"] == 2 * 100 * worker._MB
+
+
 def test_a_package_storage_cannot_read_is_left_to_the_queue(monkeypatch):
     """Not a bad deck: failing it would lose its images for good, so the queue retries."""
     deck = _Deck(_WarmFails(ServiceRequestError("connection reset")))
@@ -436,5 +497,25 @@ def test_the_range_reader_seeks_like_a_file():
     assert reader.seek(2) == 2
     assert reader.seek(3, io.SEEK_CUR) == 5
     assert reader.read(2) == b"56"
-    with pytest.raises(ValueError, match="negative"):
+    with pytest.raises(OSError, match="negative"):
         reader.seek(-1)
+
+
+@pytest.mark.parametrize("size", [0, 5, 21])
+def test_a_blob_too_short_to_be_a_zip_reads_as_not_a_zip(size):
+    """As a file does: zipfile probes the end of the archive and expects an OSError there."""
+    with worker._blob_package(_RangedBlob(b"x" * size))(256 * 1024) as stream, pytest.raises(zipfile.BadZipFile):
+        zipfile.ZipFile(stream)
+
+
+def test_a_transport_error_the_sdk_did_not_wrap_is_still_a_storage_error():
+    """The renderer leaves out a file that raises anything else, so an outage would cost images."""
+
+    class _Reset(_RangedBlob):
+        def download_blob(self, *, offset: int, length: int):
+            raise ConnectionResetError(54, "Connection reset by peer")
+
+    reader = worker._BlobRangeReader(_Reset(b"0123456789"), 10)
+
+    with pytest.raises(AzureError, match="reading the deck failed"):
+        reader.read(4)
