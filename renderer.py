@@ -32,6 +32,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+import zlib
 from collections import Counter
 from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
@@ -40,6 +41,7 @@ from html import unescape as html_unescape
 from typing import Any
 from urllib.parse import unquote
 
+import zstandard
 from anki.collection import (
     Collection,
     ImportAnkiPackageOptions,
@@ -182,15 +184,36 @@ def _attach_audio(
 
 # Decompression bounds. An .apkg is a zip that anki's importer unpacks to disk in
 # full before we ever see a card, so a small malicious archive could exhaust the
-# worker's disk (zip bomb). These bound the *decompressed* deck, read cheaply from
-# the central directory. The ceiling sits well above any real deck (media alone is
-# capped at 750 MB) while catching bombs, which advertise gigabytes-to-petabytes.
+# worker's disk (zip bomb). These bound the *unpacked* deck, counted before import;
+# a real deck within the 1 GB upload limit unpacks to about 1-1.5 GB.
 _MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _MAX_ARCHIVE_ENTRIES = 100_000
+# What anki zstd-decodes in a modern package: the cards' database, the media list,
+# and each media file, stored under its index ("0", "1", ...).
+_ZSTD_ENTRY_RE = re.compile(r"collection\.anki21b|media|\d+")
+_GUARD_READ_BYTES = 1024 * 1024
 
 
 class ApkgTooLargeError(Exception):
     """The .apkg's decompressed size or entry count exceeds the safety bounds."""
+
+
+def _size_label(n: int) -> str:
+    return f"{n / 1024**3:g} GB" if n >= 1024**3 else f"{n // 1024**2} MB"
+
+
+def _is_zstd_package(zf: zipfile.ZipFile) -> bool:
+    """Whether anki reads this package's entries as zstd: `meta` version 3 or later.
+
+    `meta` is PackageMetadata{version = 1}, so a tag byte 0x08, then the version.
+    Older packages (version 1-2, or no `meta`) store their entries as-is.
+    """
+    try:
+        with zf.open("meta") as fh:
+            raw = fh.read(2)
+    except KeyError:
+        return False
+    return len(raw) == 2 and raw[0] == 0x08 and raw[1] >= 3
 
 
 def _guard_archive_bounds(
@@ -201,27 +224,33 @@ def _guard_archive_bounds(
 ) -> None:
     """Reject an oversized/zip-bomb deck BEFORE anki extracts it to disk.
 
-    Reads only the zip central directory (advertised uncompressed sizes + entry
-    count) — no decompression — so it is cheap and fails fast. Raised errors
-    propagate to the worker's render try/except, which reports a clean import
-    failure rather than stranding the deck.
+    Counts what each entry really unpacks to, a block at a time, writing nothing:
+    the zip's own decompression (its CRC check catches an understated size), then
+    the zstd anki decodes in a modern package. The zip index alone gives a modern
+    package's compressed sizes, which let a 60 KB deck unpack to gigabytes.
+    Raised errors reach the worker's render try/except, which reports a clean
+    import failure rather than stranding the deck.
     """
+    too_large = ApkgTooLargeError(f"the deck unpacks to more than {_size_label(max_uncompressed_bytes)}")
     try:
         with zipfile.ZipFile(apkg_path) as zf:
             infos = zf.infolist()
-    except zipfile.BadZipFile as exc:
+            if len(infos) > max_entries:
+                raise ApkgTooLargeError(f"archive has {len(infos)} entries (max {max_entries})")
+            zstd = _is_zstd_package(zf)
+            decompressor = zstandard.ZstdDecompressor()
+            total = 0
+            for info in infos:
+                with zf.open(info) as entry:
+                    source = entry
+                    if zstd and _ZSTD_ENTRY_RE.fullmatch(info.filename):
+                        source = decompressor.stream_reader(entry, read_across_frames=True, closefd=False)
+                    while block := source.read(_GUARD_READ_BYTES):
+                        total += len(block)
+                        if total > max_uncompressed_bytes:
+                            raise too_large
+    except (zipfile.BadZipFile, zlib.error, zstandard.ZstdError) as exc:
         raise ApkgTooLargeError(f"not a valid .apkg archive: {exc}") from exc
-
-    if len(infos) > max_entries:
-        raise ApkgTooLargeError(f"archive has {len(infos)} entries (max {max_entries})")
-
-    total = 0
-    for info in infos:
-        total += info.file_size
-        if total > max_uncompressed_bytes:
-            raise ApkgTooLargeError(
-                f"decompressed size exceeds {max_uncompressed_bytes // (1024 * 1024)} MB"
-            )
 
 
 class RenderingDeck:
@@ -278,6 +307,22 @@ class RenderingDeck:
     def __iter__(self) -> Iterator[RenderedCard]:
         for cid in self._card_ids:
             yield self._render(cid)
+
+    def media_files(self) -> list[tuple[str, str]]:
+        """The deck's media files as (path, name), for a sink that stores them ahead of rendering.
+
+        Each passes the same gate as `_store`; links and folders are left out.
+        """
+        files = []
+        with os.scandir(self._media_dir) as entries:
+            for entry in entries:
+                name = safe_media_name(entry.name)
+                if name is None or not entry.is_file(follow_symlinks=False):
+                    continue
+                local = os.path.join(self._media_dir, name)
+                if within_dir(self._media_dir, local):
+                    files.append((local, name))
+        return files
 
     def _placed(self, cid: int) -> tuple[str, dict[str, Any]]:
         """The card's deck name and note type (the current deck, for a filtered one)."""

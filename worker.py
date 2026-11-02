@@ -25,8 +25,10 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING, Any
@@ -57,6 +59,11 @@ logging.getLogger("azure").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 _MB = 1024 * 1024
+# Media stored at once before rendering; under the HTTP pool's 10 connections.
+_WARM_WORKERS = 8
+# The storage client sends a file over this in 4 MB blocks read from disk, so no
+# upload holds more than this much of a file, however large the file.
+_SINGLE_PUT_BYTES = 8 * _MB
 
 # Version of the job/callback contract this worker speaks (see README, "Stable
 # interface"). Bump the major only on a breaking change.
@@ -94,40 +101,102 @@ class BlobMediaSink:
         self._max = max_bytes
         self._total = 0
         self._by_hash: dict[str, str] = {}
+        self._by_path: dict[str, str] = {}
+        # `warm` stores from several threads; these guard the totals and the hash map.
+        self._lock = threading.Lock()
+        self._in_flight: dict[str, threading.Event] = {}
 
-    def __call__(self, local_path: str, fname: str) -> "str | None":
+    def __call__(self, local_path: str, fname: str) -> str | None:
+        stored = self._by_path.get(local_path)
+        return stored if stored is not None else self._store(local_path, fname)
+
+    def warm(self, files: list[tuple[str, str]], *, workers: int = _WARM_WORKERS) -> None:
+        """Store the deck's media several files at a time, before any card renders.
+
+        Rendering then finds each file stored instead of uploading it between cards.
+        A file that fails here is tried again when a card asks for it. Skipped when
+        the folder exceeds the cap, so the cap keeps the files cards ask for first.
+        """
+        if sum(os.path.getsize(local) for local, _ in files) > self._max:
+            logger.info("media folder exceeds the %dMB cap; storing it as cards ask", self._max // _MB)
+            return
+        left = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            stores = pool.map(lambda f: self._store(*f, quiet=True), files)
+            for (local, _), stored in zip(files, stores, strict=True):
+                if stored is None:
+                    left += 1
+                else:
+                    self._by_path[local] = stored
+        if left:
+            # One line: each of these is tried again when a card asks, and logs its error then.
+            logger.warning("media warm-up left %d of %d files to rendering", left, len(files))
+
+    def _store(self, local_path: str, fname: str, *, quiet: bool = False) -> str | None:
         try:
-            with open(local_path, "rb") as fh:
-                data = fh.read()
+            md5, size = _md5_and_size(local_path)
         except OSError:
-            logger.warning("could not read media file %s", fname)
+            if not quiet:
+                logger.warning("could not read media file %s", fname)
             return None
 
-        md5 = hashlib.md5(data).hexdigest()  # noqa: S324 — blob naming, not security
-        if md5 in self._by_hash:
-            return self._by_hash[md5]
-        if self._total + len(data) > self._max:
-            logger.warning("media cap %dMB exceeded; skipping %s", self._max // _MB, fname)
-            return None
+        with self._lock:
+            if md5 in self._by_hash:
+                return self._by_hash[md5]
+            pending = self._in_flight.get(md5)
+            if pending is None:
+                if self._total + size > self._max:
+                    logger.warning("media cap %dMB exceeded; skipping %s", self._max // _MB, fname)
+                    return None
+                self._total += size  # reserved; released below if the upload fails
+                pending = self._in_flight[md5] = threading.Event()
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            # The same bytes under another name, already uploading.
+            pending.wait()
+            with self._lock:
+                return self._by_hash.get(md5)
 
         ext = os.path.splitext(fname)[1].lower()
         blob_name = f"{self._prefix}/{md5}{ext}"
+        stored = False
         try:
             bc = self._cc.get_blob_client(blob_name)
             if not bc.exists():
                 ct = _CONTENT_TYPES.get(ext)
-                bc.upload_blob(
-                    data,
-                    overwrite=True,
-                    content_settings=ContentSettings(content_type=ct) if ct else None,
-                )
+                with open(local_path, "rb") as fh:
+                    bc.upload_blob(
+                        fh,
+                        length=size,
+                        overwrite=True,
+                        content_settings=ContentSettings(content_type=ct) if ct else None,
+                    )
+            stored = True
         except Exception:
-            logger.exception("media upload failed: %s", blob_name)
-            return None
+            if not quiet:
+                logger.exception("media upload failed: %s", blob_name)
+        finally:
+            with self._lock:
+                if stored:
+                    self._by_hash[md5] = blob_name
+                else:
+                    self._total -= size
+                del self._in_flight[md5]
+            pending.set()
+        return blob_name if stored else None
 
-        self._total += len(data)
-        self._by_hash[md5] = blob_name
-        return blob_name
+
+def _md5_and_size(path: str) -> tuple[str, int]:
+    """The file's md5 and size, read a block at a time."""
+    digest = hashlib.md5()  # noqa: S324 — blob naming, not security
+    size = 0
+    with open(path, "rb") as fh:
+        while block := fh.read(_MB):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
 
 
 def _card_dict(c: Any) -> dict[str, Any]:
@@ -344,6 +413,18 @@ def _post_deck(job_id: str, deck: RenderingDeck, callback_url: str, chunk_size: 
         del cards
 
 
+def _warm_media(job_id: str, sink: BlobMediaSink, deck: RenderingDeck) -> None:
+    """Store the deck's media before rendering. A failure here only leaves it to rendering."""
+    started = time.monotonic()
+    try:
+        files = deck.media_files()
+        sink.warm(files)
+    except Exception:
+        logger.exception("media warm-up failed job_id=%s; cards will store their own media", job_id)
+        return
+    logger.info("media warm-up job_id=%s files=%d in %.1fs", job_id, len(files), time.monotonic() - started)
+
+
 def _validate_job(data: dict[str, Any]) -> "str | None":
     """Validate an inbound job against the v1 contract. Returns an error, or None.
 
@@ -400,7 +481,9 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
     # Per-job callback (validated above) lets one worker serve prod + staging.
     callback_url = message_data.get("callback_url") or settings.callback_url
 
-    blob_service = BlobServiceClient.from_connection_string(settings.azure_storage_connection_string)
+    blob_service = BlobServiceClient.from_connection_string(
+        settings.azure_storage_connection_string, max_single_put_size=_SINGLE_PUT_BYTES
+    )
     tmp = tempfile.NamedTemporaryFile(prefix="apkg_", suffix=".apkg", delete=False)
     apkg_path = tmp.name
     tmp.close()
@@ -420,6 +503,7 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
                     deck.total,
                     deck.skipped,
                 )
+                _warm_media(job_id, sink, deck)
                 _post_deck(job_id, deck, callback_url, chunk_size)
         except httpx.HTTPError:
             # A callback that did not land, not a bad deck: the queue redelivers the job.

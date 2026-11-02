@@ -10,5 +10,8 @@ azure-storage-queue==12.15.0
 # the worker dies at startup with:
 #   ImportError: Unable to create async transport. Please check aiohttp is installed.
 aiohttp>=3.9,<4.0
+# Counts what a modern .apkg's zstd entries unpack to before anki extracts them
+# (renderer._guard_archive_bounds). Python 3.12 has no zstd of its own.
+zstandard==0.25.0
 httpx>=0.27,<1.0
 python-dotenv>=1.0,<2.0

@@ -64,6 +64,9 @@ class _FakeDeck:
     def deck_name(self) -> str:
         return max(self.deck_counts, key=lambda k: self.deck_counts[k]) if self.deck_counts else "Imported deck"
 
+    def media_files(self) -> list:
+        return []
+
     def __iter__(self):
         for i, card in enumerate(self._cards):
             if i == self._fail_at:
@@ -178,7 +181,7 @@ def _run_job(monkeypatch, deck: _FakeDeck, post, **job) -> dict:
         return contextlib.nullcontext(deck)
 
     monkeypatch.setattr(
-        worker, "BlobServiceClient", types.SimpleNamespace(from_connection_string=lambda _s: _FakeBlobService())
+        worker, "BlobServiceClient", types.SimpleNamespace(from_connection_string=lambda _s, **_k: _FakeBlobService())
     )
     monkeypatch.setattr(worker, "open_apkg", open_apkg)
     monkeypatch.setattr(worker, "_post_callback", post)

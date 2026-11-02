@@ -2,15 +2,18 @@
 
 It counts its cards before rendering any, and the worker sends those counts on
 every chunk, so they must match the rendered cards. With `strip_scripts` no card
-carries a `<script>…</script>` element. Needs the AGPL `anki` package; skipped without it.
+carries a `<script>…</script>` element. Before anki unpacks a deck, the guard counts
+what it unpacks to. Needs the AGPL `anki` package; skipped without it.
 """
 
 import importlib.util
 import pathlib
 import sys
+import zipfile
 from collections import Counter
 
 import pytest
+import zstandard
 
 pytest.importorskip("anki")
 from anki.collection import Collection, ExportAnkiPackageOptions  # noqa: E402
@@ -90,11 +93,42 @@ def scripted_apkg(tmp_path_factory) -> str:
         col.close()
 
 
-def _export(col: Collection, workdir: pathlib.Path) -> str:
+@pytest.fixture(scope="module")
+def media_apkg(tmp_path_factory) -> str:
+    """1 card showing a picture the deck carries."""
+    workdir = tmp_path_factory.mktemp("media")
+    col = Collection(str(workdir / "source.anki2"))
+    try:
+        stored = col.media.write_data("heart.png", b"\x89PNG heart")
+        note = col.new_note(col.models.by_name("Basic"))
+        note["Front"] = f'<img src="{stored}">'
+        note["Back"] = "Heart"
+        col.add_note(note, col.decks.id("Cardio"))
+        return _export(col, workdir)
+    finally:
+        col.close()
+
+
+def test_media_files_lists_the_decks_files_and_nothing_that_leads_out(media_apkg, tmp_path):
+    outside = tmp_path / "secret.txt"
+    outside.write_text("not deck media")
+    with renderer.open_apkg(media_apkg, _sink) as deck:
+        media_dir = pathlib.Path(deck._media_dir)
+        (media_dir / "link.png").symlink_to(outside)
+        (media_dir / "folder").mkdir()
+
+        files = deck.media_files()
+
+    assert files == [(str(media_dir / "heart.png"), "heart.png")]
+
+
+def _export(col: Collection, workdir: pathlib.Path, *, legacy: bool = False) -> str:
     out = workdir / "deck.apkg"
     col.export_anki_package(
         out_path=str(out),
-        options=ExportAnkiPackageOptions(with_scheduling=False, with_deck_configs=False, with_media=True, legacy=False),
+        options=ExportAnkiPackageOptions(
+            with_scheduling=False, with_deck_configs=False, with_media=True, legacy=legacy
+        ),
         limit=None,
     )
     return str(out)
@@ -186,3 +220,80 @@ def test_scripts_are_kept_unless_asked(scripted_apkg):
 
     assert all("<script>" in card.front_html for card in cards)
     assert all("<SCRIPT" in card.back_html for card in cards)
+
+
+# --- What a deck unpacks to -------------------------------------------------
+
+_LIMIT = 10 * 1024 * 1024
+
+
+@pytest.fixture(scope="module", params=[False, True], ids=["modern", "older"])
+def silent_apkg(request, tmp_path_factory) -> str:
+    """12 MB of silence as a WAV: it compresses to almost nothing in a modern deck."""
+    workdir = tmp_path_factory.mktemp("silent")
+    col = Collection(str(workdir / "source.anki2"))
+    try:
+        stored = col.media.write_data("silence.wav", b"\x00" * (12 * 1024 * 1024))
+        note = col.new_note(col.models.by_name("Basic"))
+        note["Front"] = f"[sound:{stored}]"
+        note["Back"] = "Silence"
+        col.add_note(note, col.decks.id("Audio"))
+        return _export(col, workdir, legacy=request.param)
+    finally:
+        col.close()
+
+
+def _package(tmp_path: pathlib.Path, version: int, entries: dict[str, bytes]) -> str:
+    """A package written by hand, `meta` naming its format version (3 = modern)."""
+    path = tmp_path / "crafted.apkg"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("meta", bytes([0x08, version]))
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return str(path)
+
+
+def _zstd(data: bytes) -> bytes:
+    return zstandard.ZstdCompressor().compress(data)
+
+
+def test_a_deck_is_held_to_what_it_unpacks_to(silent_apkg):
+    with pytest.raises(renderer.ApkgTooLargeError, match="the deck unpacks to more than 10 MB"):
+        renderer._guard_archive_bounds(silent_apkg, max_uncompressed_bytes=_LIMIT)
+
+    with (
+        pytest.raises(renderer.ApkgTooLargeError),
+        renderer.open_apkg(silent_apkg, _sink, max_uncompressed_bytes=_LIMIT),
+    ):
+        pytest.fail("anki must not unpack the deck")
+
+
+def test_a_deck_within_the_limit_passes(silent_apkg):
+    renderer._guard_archive_bounds(silent_apkg, max_uncompressed_bytes=2 * _LIMIT)
+
+
+def test_a_bomb_is_refused_though_its_zip_index_looks_tiny(tmp_path):
+    bomb = _package(
+        tmp_path, 3, {"collection.anki21b": _zstd(b"db"), "0": _zstd(b"\x00" * (3 * _LIMIT)), "media": _zstd(b"")}
+    )
+    with zipfile.ZipFile(bomb) as zf:
+        assert sum(info.file_size for info in zf.infolist()) < 1024 * 1024
+
+    with pytest.raises(renderer.ApkgTooLargeError, match="the deck unpacks to more than 10 MB"):
+        renderer._guard_archive_bounds(bomb, max_uncompressed_bytes=_LIMIT)
+
+
+def test_a_modern_media_entry_that_is_not_zstd_is_refused(tmp_path):
+    with pytest.raises(renderer.ApkgTooLargeError, match="not a valid .apkg archive"):
+        renderer._guard_archive_bounds(_package(tmp_path, 3, {"0": b"plain bytes"}), max_uncompressed_bytes=_LIMIT)
+
+
+def test_an_older_package_is_counted_as_stored(tmp_path):
+    """Anki copies an older package's media as-is, so zstd-looking bytes there are not unpacked."""
+    older = _package(tmp_path, 2, {"0": _zstd(b"\x00" * (3 * _LIMIT))})
+
+    renderer._guard_archive_bounds(older, max_uncompressed_bytes=_LIMIT)
+
+
+def test_the_default_limit_reads_as_gb():
+    assert renderer._size_label(renderer._MAX_UNCOMPRESSED_BYTES) == "2 GB"
