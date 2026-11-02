@@ -35,9 +35,15 @@ Azure Queue job ──▶ download .apkg from blob ──▶ render every card (
   "media_prefix": "anki-media",
   "max_cards": 20000,
   "max_media_mb": 750,
-  "callback_url": "https://<your-backend>/api/v1/internal/anki/complete"
+  "callback_url": "https://<your-backend>/api/v1/internal/anki/complete",
+  "strip_scripts": true
 }
 ```
+
+`strip_scripts` is **optional**: `true` removes every `<script>` element, contents
+included, from the card HTML before its media is resolved. Send it when your
+viewer never runs card scripts; in a large shared deck such as AnKing they are
+most of the HTML. Absent (or anything but `true`), the HTML is Anki's own.
 
 `callback_url` is **optional**: supply it and the worker posts that job's results
 there (so one worker can serve several backends); omit it and the worker uses its
@@ -63,6 +69,14 @@ Header `X-Anki-Callback-Token: $ANKI_CALLBACK_SECRET`.
   "error": null
 }
 ```
+
+With a positive `chunk_size` in the job, the deck arrives across several
+callbacks of at most that many cards, each rendered and sent before the next is
+rendered. Each also carries `chunk_index`, `chunk_count`, `start_index` and the
+deck-wide `stats` (`total`, `subdecks`, `note_types`). In a chunked callback a
+note type's `css` is on its first card in that callback and empty on the rest
+(look it up by `note_type`), and `summary.degraded` is a running total that is
+complete on the last chunk.
 
 Media is uploaded to `<container>/<media_prefix>/<hash>.<ext>` and referenced in
 the card HTML by that path; SIA rewrites those into signed media-proxy URLs.

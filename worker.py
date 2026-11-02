@@ -2,10 +2,11 @@
 """Anki .apkg import worker.
 
 Polls an Azure Storage Queue for `AnkiImportRequest` jobs, downloads the deck
-from blob storage, renders every card to HTML via `renderer.render_apkg`,
+from blob storage, renders its cards to HTML via `renderer.open_apkg`,
 uploads referenced media back to the same container, and POSTs the rendered
-cards to the SIA backend's authenticated callback. The boundary is plain data
-in both directions; the worker holds no SIA code and persists nothing itself.
+cards to the SIA backend's authenticated callback, one chunk at a time. The
+boundary is plain data in both directions; the worker holds no SIA code and
+persists nothing itself.
 
 Shape mirrors the SIA exam-worker (async poll -> bounded concurrency ->
 delete-on-success -> dequeue-count retry). The heavy work (blob I/O + the
@@ -26,8 +27,9 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from itertools import islice
 from math import ceil
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
@@ -36,8 +38,11 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.storage.queue.aio import QueueServiceClient
 from dotenv import load_dotenv
 
-from renderer import RenderResult, render_apkg
+from renderer import open_apkg
 from worker_settings import WorkerSettings
+
+if TYPE_CHECKING:
+    from renderer import RenderedCard, RenderingDeck
 
 load_dotenv()
 settings = WorkerSettings.from_env()
@@ -139,38 +144,66 @@ def _card_dict(c: Any) -> dict[str, Any]:
     }
 
 
-def _job_status(result: RenderResult) -> str:
-    if result.imported == 0:
+def _chunk_cards(cards: list[RenderedCard]) -> list[dict[str, Any]]:
+    """Card dicts for one callback, each note type's stylesheet on its first card only.
+
+    The backend keeps one stylesheet per note type. Repeating it on every card
+    added about 19 MB to each 1,000-card chunk of an AnKing deck.
+    """
+    seen: set[str] = set()
+    out = []
+    for c in cards:
+        card = _card_dict(c)
+        if c.note_type in seen:
+            card["css"] = ""
+        seen.add(c.note_type)
+        out.append(card)
+    return out
+
+
+def _job_status(deck: RenderingDeck) -> str:
+    if deck.total == 0:
         return "failed"
-    return "partial" if result.skipped > 0 else "ok"
+    return "partial" if deck.skipped > 0 else "ok"
 
 
-def _deck_stats(result: RenderResult) -> dict[str, Any]:
+def _deck_stats(deck: RenderingDeck) -> dict[str, Any]:
     """Aggregate counts the backend needs for its deck overview.
 
-    Computed here because the worker holds the whole rendered deck; the backend
-    only ever sees it a chunk at a time. Capped to the most-common few so a deck
-    with pathologically many subdecks can't bloat every chunk.
+    Read from the collection before any card is rendered, so every chunk carries
+    the deck-wide figures; the backend only ever sees the deck a chunk at a time.
+    Capped to the most-common few so a deck with pathologically many subdecks
+    can't bloat every chunk.
     """
-    subdecks = Counter((c.deck or "Default").split("::")[-1] for c in result.cards)
-    note_types = Counter(c.note_type or "Basic" for c in result.cards)
+    subdecks: Counter[str] = Counter()
+    for deck_path, n in deck.deck_counts.items():
+        subdecks[(deck_path or "Default").split("::")[-1]] += n
+    note_types: Counter[str] = Counter()
+    for note_type, n in deck.note_type_counts.items():
+        note_types[note_type or "Basic"] += n
     return {
-        "total": len(result.cards),
+        "total": deck.total,
         "subdecks": dict(subdecks.most_common(50)),
         "note_types": dict(note_types.most_common(50)),
     }
 
 
-def _result_payload(job_id: str, result: RenderResult) -> dict[str, Any]:
+def _summary(deck: RenderingDeck) -> dict[str, Any]:
+    # `degraded` is a running total while the deck renders, complete on the last
+    # chunk: the one that completes the card count the backend finalises on.
+    return {"imported": deck.total, "degraded": dict(deck.degraded), "skipped": deck.skipped}
+
+
+def _failure_payload(job_id: str, error: str) -> dict[str, Any]:
     return {
         "schema_version": JOB_SCHEMA_VERSION,
         "job_id": job_id,
-        "status": _job_status(result),
-        "deck_name": result.deck_name,
-        "cards": [_card_dict(c) for c in result.cards],
-        "stats": _deck_stats(result),
-        "summary": {"imported": result.imported, "degraded": result.degraded, "skipped": result.skipped},
-        "error": None,
+        "status": "failed",
+        "deck_name": None,
+        "cards": [],
+        "stats": {"total": 0, "subdecks": {}, "note_types": {}},
+        "summary": {"imported": 0, "degraded": {}, "skipped": 0},
+        "error": error[:500],
     }
 
 
@@ -252,49 +285,63 @@ def _post_callback(payload: dict[str, Any], callback_url: str) -> None:
     )
 
 
-def _post_result(job_id: str, result: RenderResult, callback_url: str, chunk_size: "int | None") -> None:
-    """Deliver rendered cards to the backend callback.
+def _post_deck(job_id: str, deck: RenderingDeck, callback_url: str, chunk_size: "int | None") -> None:
+    """Render the deck and deliver it to the backend callback, a chunk at a time.
 
-    With a positive `chunk_size` (the backend advertising it speaks the chunked
-    contract) the cards are fanned across several callbacks so no single POST
-    ever carries a whole large deck — bounding payload size, request time, and
-    the cost of a retry. Each chunk is self-describing (`chunk_index`,
-    `chunk_count`, `start_index`) and carries the deck-wide `stats`/`summary`, so
-    the final chunk can finalise without the backend holding cross-chunk state.
-    Any chunk POST that fails raises, so the queue redelivers the whole job; the
-    backend dedupes replayed cards by their stable `uid`.
+    Each chunk is rendered, posted and released before the next is rendered, so
+    the worker holds one chunk, never the deck: a 35,000-card AnKing deck held
+    whole needed about 3.7 GiB in a 2 GiB container. Each chunk is self-describing
+    (`chunk_index`, `chunk_count`, `start_index`) and carries the deck-wide
+    `stats`, so the backend finalises by card count without holding cross-chunk
+    state. Any chunk POST that fails raises, so the queue redelivers the whole
+    job; the backend dedupes replayed cards by their stable `uid`.
 
     Absent/zero `chunk_size` falls back to a single callback (v1 behaviour), so a
     new worker stays correct against a backend that predates chunking.
     """
-    cards = [_card_dict(c) for c in result.cards]
-    if not chunk_size or chunk_size <= 0 or not cards:
-        _post_callback(_result_payload(job_id, result), callback_url)
+    if not chunk_size or deck.total == 0:
+        cards = [_card_dict(c) for c in deck]
+        _post_callback(
+            {
+                "schema_version": JOB_SCHEMA_VERSION,
+                "job_id": job_id,
+                "status": _job_status(deck),
+                "deck_name": deck.deck_name,
+                "cards": cards,
+                "stats": _deck_stats(deck),
+                "summary": _summary(deck),
+                "error": None,
+            },
+            callback_url,
+        )
         return
 
-    status = _job_status(result)
-    stats = _deck_stats(result)
-    summary = {"imported": result.imported, "degraded": result.degraded, "skipped": result.skipped}
-    chunk_count = ceil(len(cards) / chunk_size)
-    logger.info("chunking job_id=%s cards=%d into %d chunk(s) of %d", job_id, len(cards), chunk_count, chunk_size)
+    status = _job_status(deck)
+    stats = _deck_stats(deck)
+    chunk_count = ceil(deck.total / chunk_size)
+    logger.info("chunking job_id=%s cards=%d into %d chunk(s) of %d", job_id, deck.total, chunk_count, chunk_size)
+    rendering = iter(deck)
     for idx in range(chunk_count):
-        start = idx * chunk_size
+        # Rendered before the payload is built, so `summary` counts this chunk's
+        # missing media; dropped after its POST, so one chunk is held at a time.
+        cards = _chunk_cards(list(islice(rendering, chunk_size)))
         _post_callback(
             {
                 "schema_version": JOB_SCHEMA_VERSION,
                 "job_id": job_id,
                 "status": status,
-                "deck_name": result.deck_name,
+                "deck_name": deck.deck_name,
                 "chunk_index": idx,
                 "chunk_count": chunk_count,
-                "start_index": start,
-                "cards": cards[start : start + chunk_size],
+                "start_index": idx * chunk_size,
+                "cards": cards,
                 "stats": stats,
-                "summary": summary,
+                "summary": _summary(deck),
                 "error": None,
             },
             callback_url,
         )
+        del cards
 
 
 def _validate_job(data: dict[str, Any]) -> "str | None":
@@ -346,6 +393,10 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
     # Absent -> one callback (a backend that predates chunking).
     raw_chunk = message_data.get("chunk_size")
     chunk_size = int(raw_chunk) if isinstance(raw_chunk, int) and not isinstance(raw_chunk, bool) and raw_chunk > 0 else None
+    # Optional (additive, still v1): a literal true drops every <script> element from
+    # the card HTML, for a backend whose viewer never runs them. They were 80% of the
+    # HTML in a student's AnKing deck. Absent -> the HTML exactly as Anki renders it.
+    strip_scripts = message_data.get("strip_scripts") is True
     # Per-job callback (validated above) lets one worker serve prod + staging.
     callback_url = message_data.get("callback_url") or settings.callback_url
 
@@ -361,31 +412,22 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
 
         sink = BlobMediaSink(cc, media_prefix, max_media_mb * _MB)
         try:
-            result = render_apkg(apkg_path, sink, max_cards=max_cards)
+            with open_apkg(apkg_path, sink, max_cards=max_cards, strip_scripts=strip_scripts) as deck:
+                logger.info(
+                    "imported job_id=%s deck=%r cards=%d skipped=%d",
+                    job_id,
+                    deck.deck_name,
+                    deck.total,
+                    deck.skipped,
+                )
+                _post_deck(job_id, deck, callback_url, chunk_size)
+        except httpx.HTTPError:
+            # A callback that did not land, not a bad deck: the queue redelivers the job.
+            raise
         except Exception as exc:
             logger.exception("render failed job_id=%s", job_id)
-            _post_callback(
-                {
-                    "schema_version": JOB_SCHEMA_VERSION,
-                    "job_id": job_id,
-                    "status": "failed",
-                    "deck_name": None,
-                    "cards": [],
-                    "stats": {"total": 0, "subdecks": {}, "note_types": {}},
-                    "summary": {"imported": 0, "degraded": {}, "skipped": 0},
-                    "error": str(exc)[:500],
-                },
-                callback_url,
-            )
+            _post_callback(_failure_payload(job_id, str(exc)), callback_url)
             return
-        logger.info(
-            "rendered job_id=%s deck=%r imported=%d skipped=%d",
-            job_id,
-            result.deck_name,
-            result.imported,
-            result.skipped,
-        )
-        _post_result(job_id, result, callback_url, chunk_size)
     finally:
         try:
             os.unlink(apkg_path)
@@ -394,7 +436,7 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
         blob_service.close()
 
 
-def _post_job_abandoned(message_data: dict[str, Any], attempts: int, exc: Exception) -> None:
+def _post_job_abandoned(message_data: dict[str, Any], reason: str) -> None:
     """Report a job the worker has given up on, so the deck fails now, not in 30 minutes."""
     # Re-validated because this runs OUTSIDE _process_job_sync: never POST the
     # shared secret to a callback_url that has not passed the host allowlist.
@@ -403,19 +445,7 @@ def _post_job_abandoned(message_data: dict[str, Any], attempts: int, exc: Except
     job_id = message_data["job_id"]
     callback_url = message_data.get("callback_url") or settings.callback_url
     try:
-        _post_callback(
-            {
-                "schema_version": JOB_SCHEMA_VERSION,
-                "job_id": job_id,
-                "status": "failed",
-                "deck_name": None,
-                "cards": [],
-                "stats": {"total": 0, "subdecks": {}, "note_types": {}},
-                "summary": {"imported": 0, "degraded": {}, "skipped": 0},
-                "error": f"import abandoned after {attempts} attempt(s): {exc}"[:500],
-            },
-            callback_url,
-        )
+        _post_callback(_failure_payload(job_id, reason), callback_url)
     except Exception:
         logger.exception("could not report abandoned job job_id=%s", job_id)
 
@@ -485,6 +515,21 @@ class AnkiWorker:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await renewer
 
+    async def _abandon(
+        self, queue_message: Any, message_data: dict[str, Any], reason: str, stop: asyncio.Event, renewer: asyncio.Task
+    ) -> None:
+        """Report the deck failed, then drop its message: the retry budget is spent."""
+        logger.error("message id=%s exceeded MAX_RETRIES=%d; deleting", queue_message.id, settings.max_retries)
+        # Still leased across the abandon callback (it retries, so it is not
+        # instant), then stopped before the delete: a renewal in flight would
+        # invalidate the receipt we delete with.
+        await asyncio.to_thread(_post_job_abandoned, message_data, reason)
+        await self._stop_renewer(stop, renewer)
+        try:
+            await self.queue_client.delete_message(queue_message)
+        except Exception:
+            logger.exception("failed to delete poisoned message id=%s", queue_message.id)
+
     async def _process_and_cleanup(self, queue_message: Any, message_data: dict[str, Any]) -> None:
         # Hold the lease for as long as the render actually takes. Without it a
         # deck slower than the window came back on the queue mid-run, was rendered
@@ -493,6 +538,14 @@ class AnkiWorker:
         stop_renewing = asyncio.Event()
         renewer = asyncio.create_task(self._keep_message_visible(queue_message, stop_renewing))
         try:
+            # A run that was killed (out of memory, say) never reached the except
+            # below, so the budget is also checked on arrival: this many deliveries
+            # came before this one and none of them finished.
+            earlier = (queue_message.dequeue_count or 1) - 1
+            if earlier >= settings.max_retries:
+                reason = f"the import was interrupted {earlier} times"
+                await self._abandon(queue_message, message_data, reason, stop_renewing, renewer)
+                return
             await asyncio.to_thread(_process_job_sync, message_data)
             await self._stop_renewer(stop_renewing, renewer)
             await self.queue_client.delete_message(queue_message)
@@ -507,16 +560,8 @@ class AnkiWorker:
             # without this the deck read as still importing until the backend's
             # stranded-file reconciler noticed it half an hour later.
             if dequeue_count >= settings.max_retries:
-                logger.error("message id=%s exceeded MAX_RETRIES=%d; deleting", queue_message.id, settings.max_retries)
-                # Still leased across the abandon callback (it retries, so it is
-                # not instant), then stopped before the delete: a renewal in
-                # flight would invalidate the receipt we delete with.
-                await asyncio.to_thread(_post_job_abandoned, message_data, dequeue_count, exc)
-                await self._stop_renewer(stop_renewing, renewer)
-                try:
-                    await self.queue_client.delete_message(queue_message)
-                except Exception:
-                    logger.exception("failed to delete poisoned message id=%s", queue_message.id)
+                reason = f"import abandoned after {dequeue_count} attempt(s): {exc}"
+                await self._abandon(queue_message, message_data, reason, stop_renewing, renewer)
         finally:
             # Belt and braces: the retry path above leaves the message to be
             # redelivered, which is correct, but the renewer must not outlive it.

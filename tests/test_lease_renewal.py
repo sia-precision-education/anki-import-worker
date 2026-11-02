@@ -29,8 +29,7 @@ os.environ.setdefault("ANKI_CALLBACK_URL", "https://backend.invalid/api/v1/anki/
 os.environ.setdefault("ANKI_CALLBACK_SECRET", "test-secret")
 
 _renderer = types.ModuleType("renderer")
-_renderer.RenderResult = object
-_renderer.render_apkg = lambda *a, **k: None  # noqa: ARG005
+_renderer.open_apkg = lambda *a, **k: None  # noqa: ARG005
 sys.modules.setdefault("renderer", _renderer)
 
 import worker  # noqa: E402
@@ -178,7 +177,7 @@ def test_lease_is_held_across_the_abandon_callback(monkeypatch):
         monkeypatch.setattr(worker, "_process_job_sync", _job(0.02, fail=True))
         posted: list[str] = []
 
-        def _abandon(message_data, attempts, exc):  # noqa: ARG001
+        def _abandon(message_data, reason):  # noqa: ARG001
             import time
 
             time.sleep(0.05)
@@ -192,6 +191,51 @@ def test_lease_is_held_across_the_abandon_callback(monkeypatch):
         assert posted == ["failed"]
         assert queue.deleted, "the poisoned message must still be deletable after the callback"
         assert queue.events[-1] == "delete"
+
+    asyncio.run(scenario())
+
+
+def test_a_deck_whose_runs_were_all_killed_is_abandoned_on_arrival(monkeypatch):
+    """A killed run never reaches the except, so the budget is read from dequeue_count.
+
+    Seen live: a deck that ran the worker out of memory was killed ~20s in, every
+    15 minutes for a day, until the message's 24h TTL ran out.
+    """
+
+    async def scenario():
+        ran: list[str] = []
+        monkeypatch.setattr(worker, "_process_job_sync", lambda _data: ran.append("job"))
+        posted: list[str] = []
+        monkeypatch.setattr(worker, "_post_job_abandoned", lambda _data, reason: posted.append(reason))
+        queue = _FakeQueueClient()
+        retries = worker.settings.max_retries
+
+        message = _Message(dequeue_count=retries + 1)
+
+        await _worker(queue)._process_and_cleanup(message, {})
+
+        assert ran == [], "a deck that killed every earlier run must not be run again"
+        assert posted == [f"the import was interrupted {retries} times"]
+        assert queue.deleted == [message.pop_receipt]
+
+    asyncio.run(scenario())
+
+
+def test_the_last_delivery_within_the_budget_still_runs(monkeypatch):
+    async def scenario():
+        ran: list[str] = []
+        monkeypatch.setattr(worker, "_process_job_sync", lambda _data: ran.append("job"))
+        posted: list[str] = []
+        monkeypatch.setattr(worker, "_post_job_abandoned", lambda _data, reason: posted.append(reason))
+        queue = _FakeQueueClient()
+
+        message = _Message(dequeue_count=worker.settings.max_retries)
+
+        await _worker(queue)._process_and_cleanup(message, {})
+
+        assert ran == ["job"]
+        assert posted == []
+        assert queue.deleted == [message.pop_receipt]
 
     asyncio.run(scenario())
 
