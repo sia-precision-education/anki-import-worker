@@ -393,8 +393,8 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
     # Absent -> one callback (a backend that predates chunking).
     raw_chunk = message_data.get("chunk_size")
     chunk_size = int(raw_chunk) if isinstance(raw_chunk, int) and not isinstance(raw_chunk, bool) and raw_chunk > 0 else None
-    # Optional (additive, still v1): a literal true drops every <script> element from
-    # the card HTML, for a backend whose viewer never runs them. They were 80% of the
+    # Optional (additive, still v1): a literal true drops <script> elements from the card
+    # HTML (see renderer.remove_scripts), for a backend whose viewer never runs them. They were 80% of the
     # HTML in a student's AnKing deck. Absent -> the HTML exactly as Anki renders it.
     strip_scripts = message_data.get("strip_scripts") is True
     # Per-job callback (validated above) lets one worker serve prod + staging.

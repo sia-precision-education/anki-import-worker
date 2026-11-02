@@ -69,9 +69,11 @@ _MISSING_MEDIA_HTML = '<span data-anki-missing="1">Image unavailable</span>'
 # `card.question()/answer()` keep audio out of the HTML and leave a placeholder
 # token; the filenames come from the AV-tag lists instead.
 _AV_PLACEHOLDER_RE = re.compile(r"\[anki:play:[qa]:\d+\]")
-# A script element as a browser parses it: from `<script` to its end tag or, left
-# open, to the end of the document. The name must end at whitespace, `/` or `>`.
-_SCRIPT_RE = re.compile(r"<script(?=[\s/>])[^>]*>.*?(?:</script(?=[\s/>])[^>]*>|\Z)", re.IGNORECASE | re.DOTALL)
+# A script element from `<script` to its end tag; the name must end at whitespace,
+# `/` or `>`. Removed only when unambiguous (see `remove_scripts`): a script left in
+# costs bytes, since the viewers never run one, while a wrong match deletes card text.
+_SCRIPT_RE = re.compile(r"<script(?=[\s/>])[^>]*>.*?</script(?=[\s/>])[^>]*>", re.IGNORECASE | re.DOTALL)
+_SCRIPT_OPEN_RE = re.compile(r"<script(?=[\s/>])", re.IGNORECASE)
 
 
 @dataclass
@@ -102,8 +104,18 @@ class RenderResult:
 
 
 def remove_scripts(html: str) -> str:
-    """The HTML without its `<script>` elements, contents included."""
-    return _SCRIPT_RE.sub("", html)
+    """The HTML without its unambiguous `<script>` elements, contents included.
+
+    A match holding a second `<script` opening is kept whole: the first was text in a
+    comment, an attribute or a `<style>`, or the script nests one, so the match may
+    span card text. A script with no end tag is kept too.
+    """
+    return _SCRIPT_RE.sub(_drop_unambiguous_script, html)
+
+
+def _drop_unambiguous_script(match: re.Match[str]) -> str:
+    nested = _SCRIPT_OPEN_RE.search(match.string, match.start() + 1, match.end())
+    return match.group(0) if nested else ""
 
 
 def _rewrite_img_media(
@@ -340,7 +352,7 @@ def open_apkg(
 ) -> Generator[RenderingDeck, None, None]:
     """Import a `.apkg` into a throwaway collection, removed when the block exits.
 
-    With `strip_scripts`, the rendered HTML has no `<script>` elements.
+    With `strip_scripts`, `<script>` elements are removed from the rendered HTML (see `remove_scripts`).
     """
     _guard_archive_bounds(
         apkg_path, max_uncompressed_bytes=max_uncompressed_bytes, max_entries=max_entries

@@ -40,8 +40,11 @@ Azure Queue job ──▶ download .apkg from blob ──▶ render every card (
 }
 ```
 
-`strip_scripts` is **optional**: `true` removes every `<script>` element, contents
-included, from the card HTML before its media is resolved. Send it when your
+`strip_scripts` is **optional**: `true` removes `<script>…</script>` elements,
+contents included, from the card HTML before its media is resolved. A match that
+holds a second `<script` opening is left as it is, and so is a `<script>` with no
+end tag: the `<script` may be text in a comment, an attribute or a `<style>`, and
+removing that match would delete card text. Send it when your
 viewer never runs card scripts; in a large shared deck such as AnKing they are
 most of the HTML. Absent (or anything but `true`), the HTML is Anki's own.
 

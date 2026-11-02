@@ -2,7 +2,7 @@
 
 It counts its cards before rendering any, and the worker sends those counts on
 every chunk, so they must match the rendered cards. With `strip_scripts` no card
-carries a `<script>`. Needs the AGPL `anki` package; skipped without it.
+carries a `<script>…</script>` element. Needs the AGPL `anki` package; skipped without it.
 """
 
 import importlib.util
@@ -145,12 +145,25 @@ def test_render_apkg_still_returns_the_whole_deck(apkg):
         ('a<SCRIPT type="text/javascript">x()</SCRIPT >b', "ab"),
         ("a<script>if (a < b) {}</script>b<script src=x.js></script>c", "abc"),
         ("a<script>x</scriptx>y</script>b", "ab"),  # `</scriptx>` does not end it
-        ('a<script>var s = "</div>";', "a"),  # left open, a browser hides the rest too
-        ("a<script/>b", "a"),  # not a void element: still runs to its end tag
+        ("a<script/>b</script>c", "ac"),  # not a void element: still runs to its end tag
         ("<noscript>n</noscript><scripts>s</scripts><style>.a{}</style>", None),
+        # No end tag: left in place, so a `<script` that is not a tag costs no card text.
+        ('a<script>var s = "</div>";', None),
+        ("a<script/>b", None),
+        ('<!-- <script src="x.js"> -->Answer: <b>beta-lactam</b>', None),
+        ('<div title="see <script> note">Answer: <b>beta-lactam</b></div>', None),
+        # A second `<script` inside the match: the first was not a tag, or the script
+        # nests one. Kept whole, so the card text it spans survives.
+        ("<!-- the <script> below shows hints --><script>hint()</script><div>Answer</div>", None),
+        ('<div title="see <script> note">Answer</div><script>x()</script>', None),
+        ("<style>/* no <script> here */ .a{}</style><div>Answer</div><script>x()</script>", None),
+        ('<script><!-- document.write("<script></script>"); --></script><div>Answer</div>', None),
+        # Only the ambiguous match is kept; the side's other scripts still go.
+        ("<script>a()</script><!-- <script> --><script>b()</script>X", "<!-- <script> --><script>b()</script>X"),
+        ("<!-- <script>old()</script> --><div>Answer</div>", "<!--  --><div>Answer</div>"),
     ],
 )
-def test_remove_scripts_ends_each_script_where_a_browser_does(html, expected):
+def test_remove_scripts_removes_only_unambiguous_scripts(html, expected):
     assert renderer.remove_scripts(html) == (html if expected is None else expected)
 
 
