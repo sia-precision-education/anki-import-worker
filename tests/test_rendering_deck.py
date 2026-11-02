@@ -7,8 +7,11 @@ what it unpacks to. Needs the AGPL `anki` package; skipped without it.
 """
 
 import importlib.util
+import json
+import os
 import pathlib
 import sys
+import unicodedata
 import zipfile
 from collections import Counter
 
@@ -17,6 +20,7 @@ import zstandard
 
 pytest.importorskip("anki")
 from anki.collection import Collection, ExportAnkiPackageOptions  # noqa: E402
+from anki.import_export_pb2 import MediaEntries
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -93,33 +97,115 @@ def scripted_apkg(tmp_path_factory) -> str:
         col.close()
 
 
-@pytest.fixture(scope="module")
-def media_apkg(tmp_path_factory) -> str:
-    """1 card showing a picture the deck carries."""
+@pytest.fixture(scope="module", params=[False, True], ids=["modern", "older"])
+def media_apkg(request, tmp_path_factory) -> str:
+    """2 cards showing pictures and a sound the deck carries, under awkward names."""
     workdir = tmp_path_factory.mktemp("media")
     col = Collection(str(workdir / "source.anki2"))
     try:
-        stored = col.media.write_data("heart.png", b"\x89PNG heart")
-        note = col.new_note(col.models.by_name("Basic"))
-        note["Front"] = f'<img src="{stored}">'
-        note["Back"] = "Heart"
+        for name, data in _MEDIA.items():
+            assert col.media.write_data(name, data) == name
+        basic = col.models.by_name("Basic")
+        note = col.new_note(basic)
+        note["Front"] = '<img src="heart.png"> <img src="fig 1&amp;2.png">'
+        note["Back"] = "Heart [sound:beat.mp3]"
         col.add_note(note, col.decks.id("Cardio"))
-        return _export(col, workdir)
+        note = col.new_note(basic)
+        note["Front"] = '<img src="café.jpg"> <img src="../outside.png">'
+        note["Back"] = "Cafe"
+        col.add_note(note, col.decks.id("Cardio"))
+        return _export(col, workdir, legacy=request.param)
     finally:
         col.close()
 
 
-def test_media_files_lists_the_decks_files_and_nothing_that_leads_out(media_apkg, tmp_path):
-    outside = tmp_path / "secret.txt"
-    outside.write_text("not deck media")
+_MEDIA = {
+    "heart.png": b"\x89PNG heart",
+    "fig 1&2.png": b"\x89PNG figure",
+    "café.jpg": b"\xff\xd8 cafe",
+    "beat.mp3": b"ID3 beat",
+}
+
+
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.received: dict[str, bytes] = {}
+
+    def __call__(self, local: str, name: str) -> str:
+        self.received[name] = pathlib.Path(local).read_bytes()
+        return f"anki-media/{name}"
+
+
+def test_anki_unpacks_no_media_and_cards_take_it_from_the_package(media_apkg):
+    sink = _RecordingSink()
+    with renderer.open_apkg(media_apkg, sink) as deck:
+        assert os.listdir(deck._col.media.dir()) == [], "anki was given an empty media list"
+        cards = list(deck)
+        assert not [p for p in os.listdir(deck.media.scratch_dir) if p.startswith("media_")], "temp files removed"
+
+    assert sink.received == _MEDIA, "every file the cards show, byte for byte"
+    html = "".join(c.front_html + c.back_html for c in cards)
+    for name in _MEDIA:
+        assert f"anki-media/{name}" in html
+    # One player attached; the reference that leads outside is the only one missing,
+    # once per side (the Basic back repeats the front).
+    assert deck.degraded == {"audio": 1, "media": 2}
+
+
+def test_media_is_listed_in_archive_order_with_its_sizes(media_apkg):
     with renderer.open_apkg(media_apkg, _sink) as deck:
-        media_dir = pathlib.Path(deck._media_dir)
-        (media_dir / "link.png").symlink_to(outside)
-        (media_dir / "folder").mkdir()
+        listed = deck.media.entries()
+        read = [(f.name, f.size, f.data) for f in deck.media.iter_files(in_memory_max=1024)]
 
-        files = deck.media_files()
+    assert sorted(listed) == sorted((name, len(data)) for name, data in _MEDIA.items())
+    assert read == [(name, size, _MEDIA[name]) for name, size in listed], "one pass, in the listed order"
 
-    assert files == [(str(media_dir / "heart.png"), "heart.png")]
+
+def test_media_already_stored_is_not_read_again(media_apkg):
+    sink = _RecordingSink()
+    with renderer.open_apkg(media_apkg, sink) as deck:
+        deck.seed_media({name: f"stored/{name}" for name in _MEDIA})
+        cards = list(deck)
+
+    assert sink.received == {}
+    assert "stored/heart.png" in cards[0].front_html + cards[1].front_html
+
+
+def test_a_file_the_sink_has_no_room_for_is_not_read(media_apkg):
+    class _Full(_RecordingSink):
+        def has_room(self, _size: int) -> bool:
+            return False
+
+    sink = _Full()
+    with renderer.open_apkg(media_apkg, sink) as deck:
+        deck.media.extract = lambda _name: pytest.fail("read a file the sink could not take")
+        list(deck)
+
+    assert sink.received == {}
+
+
+def test_a_large_file_is_read_to_a_temp_file(media_apkg):
+    with renderer.open_apkg(media_apkg, _sink) as deck:
+        files = list(deck.media.iter_files(in_memory_max=0))
+        assert all(f.data is None and pathlib.Path(f.path).read_bytes() == _MEDIA[f.name] for f in files)
+        for f in files:
+            f.discard()
+        assert not [p for p in os.listdir(deck.media.scratch_dir) if p.startswith("media_")]
+
+
+def test_the_package_is_read_through_an_opener(media_apkg):
+    """How the worker reads a deck where it lies: small read-ahead to render, large for one pass."""
+    opened: list[int] = []
+
+    def opener(buffer_size: int):
+        opened.append(buffer_size)
+        return open(media_apkg, "rb", buffering=buffer_size)
+
+    with renderer.open_apkg(opener, _sink) as deck:
+        list(deck.media.iter_files(in_memory_max=1024))
+        list(deck)
+
+    assert opened == [renderer.RANDOM_READ_BYTES, renderer.SEQUENTIAL_READ_BYTES]
 
 
 def _export(col: Collection, workdir: pathlib.Path, *, legacy: bool = False) -> str:
@@ -227,22 +313,6 @@ def test_scripts_are_kept_unless_asked(scripted_apkg):
 _LIMIT = 10 * 1024 * 1024
 
 
-@pytest.fixture(scope="module", params=[False, True], ids=["modern", "older"])
-def silent_apkg(request, tmp_path_factory) -> str:
-    """12 MB of silence as a WAV: it compresses to almost nothing in a modern deck."""
-    workdir = tmp_path_factory.mktemp("silent")
-    col = Collection(str(workdir / "source.anki2"))
-    try:
-        stored = col.media.write_data("silence.wav", b"\x00" * (12 * 1024 * 1024))
-        note = col.new_note(col.models.by_name("Basic"))
-        note["Front"] = f"[sound:{stored}]"
-        note["Back"] = "Silence"
-        col.add_note(note, col.decks.id("Audio"))
-        return _export(col, workdir, legacy=request.param)
-    finally:
-        col.close()
-
-
 def _package(tmp_path: pathlib.Path, version: int, entries: dict[str, bytes]) -> str:
     """A package written by hand, `meta` naming its format version (3 = modern)."""
     path = tmp_path / "crafted.apkg"
@@ -257,43 +327,141 @@ def _zstd(data: bytes) -> bytes:
     return zstandard.ZstdCompressor().compress(data)
 
 
-def test_a_deck_is_held_to_what_it_unpacks_to(silent_apkg):
-    with pytest.raises(renderer.ApkgTooLargeError, match="the deck unpacks to more than 10 MB"):
-        renderer._guard_archive_bounds(silent_apkg, max_uncompressed_bytes=_LIMIT)
+def _media_list(*entries: tuple[str, int]) -> bytes:
+    listed = MediaEntries()
+    for name, size in entries:
+        listed.entries.add(name=name, size=size)
+    return _zstd(listed.SerializeToString())
+
+
+def _opened(path: str):
+    """The package's zip and media, as `open_apkg` reads them, without importing it."""
+    zf = zipfile.ZipFile(path)
+    zstd = renderer._is_zstd_package(zf)
+    return zf, renderer.PackageMedia(
+        zf, zstd, renderer._read_media_list(zf, zstd), renderer._as_opener(path), str(pathlib.Path(path).parent)
+    )
+
+
+def test_a_card_database_that_unpacks_past_the_limit_is_refused(tmp_path):
+    bomb = _package(tmp_path, 3, {"collection.anki21b": _zstd(b"\x00" * (_LIMIT + 1)), "media": _media_list()})
+    with zipfile.ZipFile(bomb) as zf:
+        assert sum(info.file_size for info in zf.infolist()) < 1024 * 1024, "its zip index looks tiny"
+
+        with pytest.raises(renderer.ApkgTooLargeError, match="the deck's cards unpack to more than 10 MB"):
+            renderer._guard_archive_bounds(zf, zstd=True, max_collection_bytes=_LIMIT)
 
     with (
         pytest.raises(renderer.ApkgTooLargeError),
-        renderer.open_apkg(silent_apkg, _sink, max_uncompressed_bytes=_LIMIT),
+        renderer.open_apkg(bomb, _sink, max_collection_bytes=_LIMIT),
     ):
         pytest.fail("anki must not unpack the deck")
 
 
-def test_a_deck_within_the_limit_passes(silent_apkg):
-    renderer._guard_archive_bounds(silent_apkg, max_uncompressed_bytes=2 * _LIMIT)
+def test_a_card_database_within_the_limit_passes(tmp_path):
+    package = _package(tmp_path, 2, {"collection.anki21": b"\x00" * _LIMIT})
+    with zipfile.ZipFile(package) as zf:
+        renderer._guard_archive_bounds(zf, zstd=False, max_collection_bytes=_LIMIT)
 
 
-def test_a_bomb_is_refused_though_its_zip_index_looks_tiny(tmp_path):
+def test_media_does_not_count_toward_the_card_database_limit(tmp_path):
+    package = _package(tmp_path, 3, {"0": _zstd(b"\x00" * (_LIMIT + 1)), "media": _media_list(("big.wav", _LIMIT + 1))})
+    with zipfile.ZipFile(package) as zf:
+        renderer._guard_archive_bounds(zf, zstd=True, max_collection_bytes=_LIMIT)
+
+
+def test_a_media_file_past_its_declared_size_is_left_out(tmp_path):
+    """A bomb: it declares 100 bytes and unpacks to 30 MB. Reading stops past 100."""
     bomb = _package(
-        tmp_path, 3, {"collection.anki21b": _zstd(b"db"), "0": _zstd(b"\x00" * (3 * _LIMIT)), "media": _zstd(b"")}
+        tmp_path,
+        3,
+        {
+            "0": _zstd(b"\x00" * (3 * _LIMIT)),
+            "1": _zstd(b"fine"),
+            "media": _media_list(("bomb.png", 100), ("ok.png", 4)),
+        },
     )
-    with zipfile.ZipFile(bomb) as zf:
-        assert sum(info.file_size for info in zf.infolist()) < 1024 * 1024
-
-    with pytest.raises(renderer.ApkgTooLargeError, match="the deck unpacks to more than 10 MB"):
-        renderer._guard_archive_bounds(bomb, max_uncompressed_bytes=_LIMIT)
-
-
-def test_a_modern_media_entry_that_is_not_zstd_is_refused(tmp_path):
-    with pytest.raises(renderer.ApkgTooLargeError, match="not a valid .apkg archive"):
-        renderer._guard_archive_bounds(_package(tmp_path, 3, {"0": b"plain bytes"}), max_uncompressed_bytes=_LIMIT)
+    zf, media = _opened(bomb)
+    with zf:
+        assert media.extract("bomb.png") is None
+        assert [(f.name, f.data) for f in media.iter_files(in_memory_max=1024)] == [("ok.png", b"fine")]
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith("media_")], "the partial file is removed"
 
 
-def test_an_older_package_is_counted_as_stored(tmp_path):
+def test_a_media_file_over_the_per_file_limit_is_not_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "_MAX_MEDIA_FILE_BYTES", 10)
+    package = _package(tmp_path, 3, {"0": _zstd(b"x" * 11), "media": _media_list(("big.png", 11))})
+    zf, media = _opened(package)
+    with zf:
+        assert media.extract("big.png") is None
+
+
+def test_a_compressible_file_is_stored_as_what_it_unpacks_to(tmp_path):
+    """12 MB of silence compresses to almost nothing; the sink (and its cap) sees all 12 MB."""
+    silence = b"\x00" * (12 * 1024 * 1024)
+    package = _package(tmp_path, 3, {"0": _zstd(silence), "media": _media_list(("silence.wav", len(silence)))})
+    zf, media = _opened(package)
+    with zf:
+        path = media.extract("silence.wav")
+        assert pathlib.Path(path).stat().st_size == len(silence)
+
+
+def test_a_modern_media_entry_that_is_not_zstd_is_left_out(tmp_path):
+    package = _package(tmp_path, 3, {"0": b"plain bytes", "media": _media_list(("x.png", 11))})
+    zf, media = _opened(package)
+    with zf:
+        assert media.extract("x.png") is None
+
+
+def test_an_older_package_is_read_as_stored(tmp_path):
     """Anki copies an older package's media as-is, so zstd-looking bytes there are not unpacked."""
-    older = _package(tmp_path, 2, {"0": _zstd(b"\x00" * (3 * _LIMIT))})
+    packed = _zstd(b"\x00" * 1000)
+    older = _package(tmp_path, 2, {"0": packed, "media": json.dumps({"0": "x.bin"}).encode()})
+    zf, media = _opened(older)
+    with zf:
+        assert media.entries() == [("x.bin", len(packed))]
+        assert pathlib.Path(media.extract("x.bin")).read_bytes() == packed
 
-    renderer._guard_archive_bounds(older, max_uncompressed_bytes=_LIMIT)
+
+def test_names_that_are_not_bare_filenames_are_not_listed(tmp_path):
+    package = _package(
+        tmp_path, 3, {"0": _zstd(b"a"), "1": _zstd(b"b"), "media": _media_list(("../escape.png", 1), ("ok.png", 1))}
+    )
+    zf, media = _opened(package)
+    with zf:
+        assert media.entries() == [("ok.png", 1)]
+
+
+def test_a_reference_finds_its_file_whatever_its_unicode_form(tmp_path):
+    decomposed = unicodedata.normalize("NFD", "café.jpg")
+    package = _package(tmp_path, 3, {"0": _zstd(b"cafe"), "media": _media_list((decomposed, 4))})
+    zf, media = _opened(package)
+    with zf:
+        assert pathlib.Path(media.extract("café.jpg")).read_bytes() == b"cafe"
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [{"media": _zstd(b"\xff\xff not a protobuf")}, {"media": b"not zstd"}],
+    ids=["not a media list", "not zstd"],
+)
+def test_an_unreadable_media_list_is_refused(tmp_path, entries):
+    with (
+        zipfile.ZipFile(_package(tmp_path, 3, entries)) as zf,
+        pytest.raises(renderer.ApkgTooLargeError, match="not a valid .apkg archive"),
+    ):
+        renderer._read_media_list(zf, True)
+
+
+def test_a_file_that_is_not_a_zip_is_refused(tmp_path):
+    path = tmp_path / "deck.apkg"
+    path.write_bytes(b"not a zip at all")
+    with (
+        pytest.raises(renderer.ApkgTooLargeError, match="not a valid .apkg archive"),
+        renderer.open_apkg(str(path), _sink),
+    ):
+        pytest.fail("nothing to import")
 
 
 def test_the_default_limit_reads_as_gb():
-    assert renderer._size_label(renderer._MAX_UNCOMPRESSED_BYTES) == "2 GB"
+    assert renderer._size_label(renderer._MAX_COLLECTION_BYTES) == "1 GB"

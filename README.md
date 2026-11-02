@@ -17,12 +17,20 @@ us to offer to users of the network service it powers.
 ## What it does
 
 ```
-Azure Queue job ──▶ download .apkg from blob ──▶ render every card (anki)
-                                                      │
-                          upload referenced media ◀───┤
-                                                      ▼
-                              POST rendered cards to SIA callback
+Azure Queue job ──▶ read .apkg in blob (ranges) ──▶ anki imports the cards only
+                                                         │
+                 upload media straight from the .apkg ◀──┤
+                                                         ▼
+                      render each card ──▶ POST rendered cards to SIA callback
 ```
+
+The deck is never downloaded whole, and Anki never unpacks its media: Anki imports
+a copy of the package with an empty media list, and the worker reads each media
+file from the package itself (one pass, in archive order) and uploads it. The
+worker's disk holds the card database and a file or two, so its disk use does not
+grow with the deck. A media file is held to the size the package declares for it
+(and to 256 MB), so a file that unpacks past that is left out rather than filling
+the disk; the card database is held to 1 GB before Anki unpacks it.
 
 ### Job message (queue → worker)
 
@@ -34,7 +42,7 @@ Azure Queue job ──▶ download .apkg from blob ──▶ render every card (
   "apkg_blob_name": "documents/original/<hash>.apkg",
   "media_prefix": "anki-media",
   "max_cards": 20000,
-  "max_media_mb": 750,
+  "max_media_mb": 12288,
   "callback_url": "https://<your-backend>/api/v1/internal/anki/complete",
   "strip_scripts": true
 }
@@ -82,7 +90,8 @@ note type's `css` is on its first card in that callback and empty on the rest
 complete on the last chunk.
 
 Media is uploaded to `<container>/<media_prefix>/<hash>.<ext>` and referenced in
-the card HTML by that path; SIA rewrites those into signed media-proxy URLs.
+the card HTML by that path; SIA rewrites those into signed media-proxy URLs. A
+blob already at that name is left as it is (the name is a hash of the bytes).
 
 ## Stable interface (v1)
 

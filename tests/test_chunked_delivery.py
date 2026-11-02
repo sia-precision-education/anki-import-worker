@@ -64,8 +64,10 @@ class _FakeDeck:
     def deck_name(self) -> str:
         return max(self.deck_counts, key=lambda k: self.deck_counts[k]) if self.deck_counts else "Imported deck"
 
-    def media_files(self) -> list:
-        return []
+    media = types.SimpleNamespace(entries=list, iter_files=lambda **_k: iter(()))
+
+    def seed_media(self, stored: dict) -> None:
+        pass
 
     def __iter__(self):
         for i, card in enumerate(self._cards):
@@ -162,11 +164,8 @@ class _FakeBlobService:
     def get_blob_client(self, _name):
         return self
 
-    def download_blob(self):
-        return self
-
-    def readinto(self, fh):
-        fh.write(b"PK")
+    def get_blob_properties(self):
+        return types.SimpleNamespace(size=2)
 
     def close(self):
         pass

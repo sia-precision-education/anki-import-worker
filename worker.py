@@ -1,9 +1,10 @@
 # Copyright (C) 2026 SIA Precision Education — AGPL-3.0 (see LICENSE).
 """Anki .apkg import worker.
 
-Polls an Azure Storage Queue for `AnkiImportRequest` jobs, downloads the deck
-from blob storage, renders its cards to HTML via `renderer.open_apkg`,
-uploads referenced media back to the same container, and POSTs the rendered
+Polls an Azure Storage Queue for `AnkiImportRequest` jobs, reads the deck where
+it lies in blob storage (in ranges, never downloaded whole), renders its cards to
+HTML via `renderer.open_apkg`, uploads its media back to the same container
+straight from the package, and POSTs the rendered
 cards to the SIA backend's authenticated callback, one chunk at a time. The
 boundary is plain data in both directions; the worker holds no SIA code and
 persists nothing itself.
@@ -19,23 +20,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
 import signal
 import sys
-import tempfile
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from itertools import islice
 from math import ceil
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO
 from urllib.parse import urlparse
 
 import httpx
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import AzureError, ResourceExistsError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.storage.queue.aio import QueueServiceClient
 from dotenv import load_dotenv
@@ -44,7 +46,7 @@ from renderer import open_apkg
 from worker_settings import WorkerSettings
 
 if TYPE_CHECKING:
-    from renderer import RenderedCard, RenderingDeck
+    from renderer import MediaFile, PackageMedia, PackageOpener, RenderedCard, RenderingDeck
 
 load_dotenv()
 settings = WorkerSettings.from_env()
@@ -59,10 +61,14 @@ logging.getLogger("azure").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 _MB = 1024 * 1024
-# Media stored at once before rendering; under the HTTP pool's 10 connections.
+# Media stored at once before rendering; with the package reader, under the HTTP pool's 10 connections.
 _WARM_WORKERS = 8
+# Files read from the package ahead of their uploads. Bounds what warm-up holds in
+# memory: this many files of at most `_SINGLE_PUT_BYTES` each, plus the one just read.
+_WARM_AHEAD = 2 * _WARM_WORKERS
 # The storage client sends a file over this in 4 MB blocks read from disk, so no
-# upload holds more than this much of a file, however large the file.
+# upload holds more than this much of a file, however large the file. Files up to
+# this size are read from the package into memory; larger ones into a temp file.
 _SINGLE_PUT_BYTES = 8 * _MB
 
 # Version of the job/callback contract this worker speaks (see README, "Stable
@@ -86,6 +92,56 @@ _CONTENT_TYPES = {
 }
 
 
+class _BlobRangeReader(io.RawIOBase):
+    """A blob as a seekable file, read in ranges: the package is never downloaded whole.
+
+    Wrapped in a `BufferedReader`, whose buffer size is the read-ahead per request.
+    Storage errors propagate (the SDK has already retried them), failing the job so
+    the queue retries it.
+    """
+
+    def __init__(self, blob_client: Any, size: int) -> None:
+        self._bc = blob_client
+        self._size = size
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}[whence]
+        if base + offset < 0:
+            msg = "negative seek position"
+            raise ValueError(msg)
+        self._pos = base + offset
+        return self._pos
+
+    def readinto(self, buffer: Any) -> int:
+        n = min(len(buffer), self._size - self._pos)
+        if n <= 0:
+            return 0
+        data = self._bc.download_blob(offset=self._pos, length=n).readall()
+        memoryview(buffer).cast("B")[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+
+def _blob_package(blob_client: Any) -> PackageOpener:
+    """Open the deck where it lies in blob storage, with the read-ahead the caller asks for."""
+    size = blob_client.get_blob_properties().size
+
+    def open_package(buffer_size: int) -> BinaryIO:
+        return io.BufferedReader(_BlobRangeReader(blob_client, size), buffer_size=buffer_size)
+
+    return open_package
+
+
 class BlobMediaSink:
     """Uploads deck media into the user's container under a fixed prefix.
 
@@ -101,45 +157,79 @@ class BlobMediaSink:
         self._max = max_bytes
         self._total = 0
         self._by_hash: dict[str, str] = {}
-        self._by_path: dict[str, str] = {}
         # `warm` stores from several threads; these guard the totals and the hash map.
         self._lock = threading.Lock()
         self._in_flight: dict[str, threading.Event] = {}
 
     def __call__(self, local_path: str, fname: str) -> str | None:
-        stored = self._by_path.get(local_path)
-        return stored if stored is not None else self._store(local_path, fname)
-
-    def warm(self, files: list[tuple[str, str]], *, workers: int = _WARM_WORKERS) -> None:
-        """Store the deck's media several files at a time, before any card renders.
-
-        Rendering then finds each file stored instead of uploading it between cards.
-        A file that fails here is tried again when a card asks for it. Skipped when
-        the folder exceeds the cap, so the cap keeps the files cards ask for first.
-        """
-        if sum(os.path.getsize(local) for local, _ in files) > self._max:
-            logger.info("media folder exceeds the %dMB cap; storing it as cards ask", self._max // _MB)
-            return
-        left = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            stores = pool.map(lambda f: self._store(*f, quiet=True), files)
-            for (local, _), stored in zip(files, stores, strict=True):
-                if stored is None:
-                    left += 1
-                else:
-                    self._by_path[local] = stored
-        if left:
-            # One line: each of these is tried again when a card asks, and logs its error then.
-            logger.warning("media warm-up left %d of %d files to rendering", left, len(files))
-
-    def _store(self, local_path: str, fname: str, *, quiet: bool = False) -> str | None:
         try:
             md5, size = _md5_and_size(local_path)
         except OSError:
-            if not quiet:
-                logger.warning("could not read media file %s", fname)
+            logger.warning("could not read media file %s", fname)
             return None
+        return self._put(md5, size, fname, lambda: open(local_path, "rb"))
 
+    def has_room(self, size: int) -> bool:
+        """Whether a file this large still fits under the cap; the deck skips reading one that does not."""
+        with self._lock:
+            return self._total + size <= self._max
+
+    def warm(self, media: PackageMedia) -> dict[str, str]:
+        """Store the deck's media several files at a time, before any card renders.
+
+        Reads the package once, in archive order, and returns what it stored by
+        name, for the deck to render from. A file that fails here is tried again
+        when a card asks for it. Skipped when the sizes the package declares exceed
+        the cap, so the cap keeps the files cards ask for first.
+        """
+        entries = media.entries()
+        if sum(size for _, size in entries) > self._max:
+            logger.info("deck media exceeds the %dMB cap; storing it as cards ask", self._max // _MB)
+            return {}
+        stored: dict[str, str] = {}
+        ahead = threading.BoundedSemaphore(_WARM_AHEAD)
+        uploads: list[tuple[str, Future[str | None]]] = []
+        last_large: Future[str | None] | None = None
+        with ThreadPoolExecutor(max_workers=_WARM_WORKERS) as pool:
+            for file in media.iter_files(in_memory_max=_SINGLE_PUT_BYTES):
+                if file.path is not None and last_large is not None:
+                    # Large files go through disk; one uploads while the next is read.
+                    wait([last_large])
+                ahead.acquire()
+                upload = pool.submit(self._warm_one, file)
+                upload.add_done_callback(lambda _u: ahead.release())
+                if file.path is not None:
+                    last_large = upload
+                uploads.append((file.name, upload))
+            for name, upload in uploads:
+                ref = upload.result()
+                if ref is not None:
+                    stored[name] = ref
+        if len(stored) < len(entries):
+            # One line: each of these is tried again when a card asks, and logs its error then.
+            logger.warning("media warm-up left %d of %d files to rendering", len(entries) - len(stored), len(entries))
+        return stored
+
+    def _warm_one(self, file: MediaFile) -> str | None:
+        try:
+            if file.data is not None:
+                data = file.data
+                md5 = hashlib.md5(data).hexdigest()
+                return self._put(md5, len(data), file.name, lambda: io.BytesIO(data), quiet=True)
+            path = file.path
+            if path is None:
+                return None
+            md5, size = _md5_and_size(path)
+            return self._put(md5, size, file.name, lambda: open(path, "rb"), quiet=True)
+        except OSError:
+            return None
+        finally:
+            file.data = None
+            file.discard()
+
+    def _put(
+        self, md5: str, size: int, fname: str, open_source: Callable[[], BinaryIO], *, quiet: bool = False
+    ) -> str | None:
         with self._lock:
             if md5 in self._by_hash:
                 return self._by_hash[md5]
@@ -163,16 +253,7 @@ class BlobMediaSink:
         blob_name = f"{self._prefix}/{md5}{ext}"
         stored = False
         try:
-            bc = self._cc.get_blob_client(blob_name)
-            if not bc.exists():
-                ct = _CONTENT_TYPES.get(ext)
-                with open(local_path, "rb") as fh:
-                    bc.upload_blob(
-                        fh,
-                        length=size,
-                        overwrite=True,
-                        content_settings=ContentSettings(content_type=ct) if ct else None,
-                    )
+            self._upload(blob_name, size, ext, open_source)
             stored = True
         except Exception:
             if not quiet:
@@ -186,6 +267,24 @@ class BlobMediaSink:
                 del self._in_flight[md5]
             pending.set()
         return blob_name if stored else None
+
+    def _upload(self, blob_name: str, size: int, ext: str, open_source: Callable[[], BinaryIO]) -> None:
+        """Create the blob unless it is there. Names are content hashes, so one that is holds these bytes."""
+        bc = self._cc.get_blob_client(blob_name)
+        # A large file is looked for first, rather than sent block by block to be refused at the end.
+        if size > _SINGLE_PUT_BYTES and bc.exists():
+            return
+        ct = _CONTENT_TYPES.get(ext)
+        with open_source() as fh:
+            try:
+                bc.upload_blob(
+                    fh,
+                    length=size,
+                    overwrite=False,
+                    content_settings=ContentSettings(content_type=ct) if ct else None,
+                )
+            except ResourceExistsError:
+                pass
 
 
 def _md5_and_size(path: str) -> tuple[str, int]:
@@ -278,7 +377,7 @@ def _failure_payload(job_id: str, error: str) -> dict[str, Any]:
 
 # A chunk POST is retried in place before the whole job is failed: a deploy-window
 # 502 costs seconds here, versus re-rendering an entire deck (or, past the dequeue
-# budget, a manual re-upload of up to 1 GB). Only transport errors and 5xx/429 are
+# budget, a manual re-upload of up to 10 GB). Only transport errors and 5xx/429 are
 # retried — a 4xx is a contract or token problem that will not fix itself.
 _CALLBACK_ATTEMPTS = 3
 _CALLBACK_BACKOFF_SECONDS = (2.0, 6.0)
@@ -414,15 +513,21 @@ def _post_deck(job_id: str, deck: RenderingDeck, callback_url: str, chunk_size: 
 
 
 def _warm_media(job_id: str, sink: BlobMediaSink, deck: RenderingDeck) -> None:
-    """Store the deck's media before rendering. A failure here only leaves it to rendering."""
+    """Store the deck's media before rendering. A failure here only leaves it to rendering.
+
+    Except a storage error reading the package: rendering reads the same package, so
+    the job fails and the queue retries it.
+    """
     started = time.monotonic()
     try:
-        files = deck.media_files()
-        sink.warm(files)
+        stored = sink.warm(deck.media)
+    except AzureError:
+        raise
     except Exception:
         logger.exception("media warm-up failed job_id=%s; cards will store their own media", job_id)
         return
-    logger.info("media warm-up job_id=%s files=%d in %.1fs", job_id, len(files), time.monotonic() - started)
+    deck.seed_media(stored)
+    logger.info("media warm-up job_id=%s files=%d in %.1fs", job_id, len(stored), time.monotonic() - started)
 
 
 def _validate_job(data: dict[str, Any]) -> "str | None":
@@ -457,7 +562,7 @@ def _validate_job(data: dict[str, Any]) -> "str | None":
 
 
 def _process_job_sync(message_data: dict[str, Any]) -> None:
-    """Blocking unit of work: download -> render -> upload media -> callback."""
+    """Blocking unit of work: read the package -> upload media -> render -> callback."""
     error = _validate_job(message_data)
     if error:
         logger.error("rejecting job (%s): %s", error, message_data)
@@ -468,7 +573,7 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
     apkg_blob_name = message_data["apkg_blob_name"]
     media_prefix = message_data.get("media_prefix", "anki-media")
     max_cards = int(message_data.get("max_cards", 20000))
-    max_media_mb = int(message_data.get("max_media_mb", 750))
+    max_media_mb = int(message_data.get("max_media_mb", 12 * 1024))
     # Optional (additive, still v1): a positive chunk_size means the backend
     # speaks the chunked-callback contract, so fan the deck across several POSTs.
     # Absent -> one callback (a backend that predates chunking).
@@ -484,18 +589,14 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
     blob_service = BlobServiceClient.from_connection_string(
         settings.azure_storage_connection_string, max_single_put_size=_SINGLE_PUT_BYTES
     )
-    tmp = tempfile.NamedTemporaryFile(prefix="apkg_", suffix=".apkg", delete=False)
-    apkg_path = tmp.name
-    tmp.close()
     try:
         cc = blob_service.get_container_client(container_name)
-        logger.info("downloading deck job_id=%s blob=%s", job_id, apkg_blob_name)
-        with open(apkg_path, "wb") as fh:
-            cc.get_blob_client(apkg_blob_name).download_blob().readinto(fh)
+        logger.info("reading deck job_id=%s blob=%s", job_id, apkg_blob_name)
+        package = _blob_package(cc.get_blob_client(apkg_blob_name))
 
         sink = BlobMediaSink(cc, media_prefix, max_media_mb * _MB)
         try:
-            with open_apkg(apkg_path, sink, max_cards=max_cards, strip_scripts=strip_scripts) as deck:
+            with open_apkg(package, sink, max_cards=max_cards, strip_scripts=strip_scripts) as deck:
                 logger.info(
                     "imported job_id=%s deck=%r cards=%d skipped=%d",
                     job_id,
@@ -505,18 +606,15 @@ def _process_job_sync(message_data: dict[str, Any]) -> None:
                 )
                 _warm_media(job_id, sink, deck)
                 _post_deck(job_id, deck, callback_url, chunk_size)
-        except httpx.HTTPError:
-            # A callback that did not land, not a bad deck: the queue redelivers the job.
+        except (httpx.HTTPError, AzureError):
+            # A callback that did not land, or the package could not be read from
+            # storage: not a bad deck, so the queue redelivers the job.
             raise
         except Exception as exc:
             logger.exception("render failed job_id=%s", job_id)
             _post_callback(_failure_payload(job_id, str(exc)), callback_url)
             return
     finally:
-        try:
-            os.unlink(apkg_path)
-        except OSError:
-            pass
         blob_service.close()
 
 
